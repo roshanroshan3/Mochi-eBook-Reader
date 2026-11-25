@@ -42,6 +42,7 @@ import androidx.compose.material.icons.rounded.DoneAll
 import androidx.compose.material.icons.rounded.FilterList
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Public
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.ViewList
@@ -138,7 +139,8 @@ fun LibraryScreen(
     onAddTag: (Long, String) -> Unit,
     onRemoveTag: (Long, Long) -> Unit,
     onBottomBarVisibilityChange: (Boolean) -> Unit,
-    onOpenStats: () -> Unit = {}
+    onOpenStats: () -> Unit = {},
+    onOpenGutenbergCatalog: () -> Unit = {}
 ) {
     val palette = LocalMochiPalette.current
     val widthClass = LocalMochiWidthClass.current
@@ -230,7 +232,7 @@ fun LibraryScreen(
                                 )
                                 if (!isCollapsed) {
                                     Text(
-                                        text = "${state.visibleBooks.size} book${if (state.visibleBooks.size == 1) "" else "s"} · Offline",
+                                        text = "${state.visibleBooks.size} book${if (state.visibleBooks.size == 1) "" else "s"} · Local & Classics",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = Color(palette.textSecondary)
                                     )
@@ -298,6 +300,15 @@ fun LibraryScreen(
                                         Icon(Icons.Rounded.Add, contentDescription = "Add folder or file", tint = Color(palette.text))
                                     }
                                     DropdownMenu(expanded = showAddMenu, onDismissRequest = { showAddMenu = false }) {
+                                        DropdownMenuItem(
+                                            text = { Text("Browse Project Gutenberg (Free)") },
+                                            leadingIcon = { Icon(Icons.Rounded.Public, contentDescription = null) },
+                                            onClick = {
+                                                showAddMenu = false
+                                                onOpenGutenbergCatalog()
+                                            },
+                                            modifier = Modifier.testTag("add_menu_gutenberg")
+                                        )
                                         DropdownMenuItem(
                                             text = { Text("Add Folder (SAF)") },
                                             leadingIcon = { Icon(Icons.Rounded.CreateNewFolder, contentDescription = null) },
@@ -571,7 +582,9 @@ fun LibraryScreen(
                                 EmptyLibraryState(
                                     mascotEnabled = prefs.mascotEnabled,
                                     hasQuery = state.filter.query.isNotBlank(),
-                                    onAddFolder = onAddSafFolder
+                                    onAddFolder = onAddSafFolder,
+                                    onImportFile = onImportFile,
+                                    onBrowseGutenberg = onOpenGutenbergCatalog
                                 )
                             }
                         } else {
@@ -1035,7 +1048,9 @@ private fun HorizontalBookRow(
 private fun EmptyLibraryState(
     mascotEnabled: Boolean,
     hasQuery: Boolean,
-    onAddFolder: () -> Unit
+    onAddFolder: () -> Unit,
+    onImportFile: () -> Unit,
+    onBrowseGutenberg: () -> Unit
 ) {
     val palette = LocalMochiPalette.current
     Column(
@@ -1049,26 +1064,46 @@ private fun EmptyLibraryState(
             MochiBlobMascot(size = 96.dp)
         }
         Text(
-            text = if (hasQuery) "No matching books" else "Your shelf is quiet",
+            text = if (hasQuery) "No matching books" else "Your shelf is ready",
             style = MaterialTheme.typography.titleLarge,
             color = Color(palette.text)
         )
         Text(
             text = if (hasQuery) "Try clearing a filter or searching by author."
-            else "Add a folder from your device using Android's file picker.",
+            else "Import your local EPUB, PDF, CBZ, or Markdown files — or download free public-domain classics from Project Gutenberg.",
             style = MaterialTheme.typography.bodyMedium,
             color = Color(palette.textSecondary)
         )
         if (!hasQuery) {
+            Spacer(modifier = Modifier.height(4.dp))
             Button(
-                onClick = onAddFolder,
+                onClick = onBrowseGutenberg,
                 shape = CircleShape,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color(palette.accent),
                     contentColor = ContrastChecker.bestOnColor(Color(palette.accent))
-                )
+                ),
+                modifier = Modifier.testTag("empty_browse_gutenberg_button")
             ) {
-                Text("Add Books Folder")
+                Icon(Icons.Rounded.Public, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Browse Free Classics (Project Gutenberg)")
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                androidx.compose.material3.OutlinedButton(
+                    onClick = onAddFolder,
+                    shape = CircleShape,
+                    modifier = Modifier.testTag("empty_add_folder_button")
+                ) {
+                    Text("Add Books Folder")
+                }
+                androidx.compose.material3.OutlinedButton(
+                    onClick = onImportFile,
+                    shape = CircleShape,
+                    modifier = Modifier.testTag("empty_import_file_button")
+                ) {
+                    Text("Import File")
+                }
             }
         }
     }

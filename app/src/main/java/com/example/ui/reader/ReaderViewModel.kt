@@ -215,8 +215,11 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun updateCurrentPage(pageIndex: Int, paginated: PaginatedBook) {
+        updateLocator(paginated.locatorForPage(pageIndex))
+    }
+
+    fun updateLocator(newLocator: ReaderLocator) {
         val bookId = _uiState.value.book?.id ?: return
-        val newLocator = paginated.locatorForPage(pageIndex)
         if (newLocator.chapterIndex != _uiState.value.currentLocator.chapterIndex ||
             kotlin.math.abs(newLocator.progression - _uiState.value.currentLocator.progression) > 0.001f
         ) {

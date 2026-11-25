@@ -34,15 +34,67 @@ data class PdfDocumentSummary(
 object PdfPageEngine {
 
     private val rendererMutex = Mutex()
-    private val maxCacheKb = (Runtime.getRuntime().maxMemory() / 1024L / 8L).toInt().coerceIn(8 * 1024, 48 * 1024)
+    private val thumbMutex = Mutex()
+
+    private val maxCacheKb = (Runtime.getRuntime().maxMemory() / 1024L / 7L).toInt().coerceIn(12 * 1024, 56 * 1024)
     private val bitmapCache = object : LruCache<String, Bitmap>(maxCacheKb) {
-        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
     }
 
+    private val maxThumbKb = 8 * 1024
+    private val thumbnailCache = object : LruCache<String, Bitmap>(maxThumbKb) {
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
+    }
+
+    private val cropBoundsCache = LruCache<String, RectF>(256)
+
+    fun bucketWidth(targetWidthPx: Int): Int =
+        ((targetWidthPx.coerceIn(280, 2200) + 127) / 128) * 128
+
+    private fun pageCacheKey(uriString: String, pageIndex: Int, widthBucket: Int, smartDarkInvert: Boolean): String =
+        "${uriString}_${pageIndex}_${widthBucket}_${if (smartDarkInvert) 1 else 0}"
+
+    fun getCachedBitmap(
+        uriString: String,
+        pageIndex: Int,
+        targetWidthPx: Int,
+        smartDarkInvert: Boolean = false
+    ): Bitmap? {
+        val exactKey = pageCacheKey(uriString, pageIndex, bucketWidth(targetWidthPx), smartDarkInvert)
+        bitmapCache.get(exactKey)?.let { bmp ->
+            if (!bmp.isRecycled) return bmp
+        }
+        // Fallback to any cached resolution for immediate display while crisp zoom re-renders
+        val prefix = "${uriString}_${pageIndex}_"
+        val suffix = "_${if (smartDarkInvert) 1 else 0}"
+        return bitmapCache.snapshot().entries.firstOrNull { (k, bmp) ->
+            k.startsWith(prefix) && k.endsWith(suffix) && !bmp.isRecycled
+        }?.value
+    }
+
+    fun getCachedThumbnail(
+        uriString: String,
+        pageIndex: Int,
+        smartDarkInvert: Boolean = false
+    ): Bitmap? = thumbnailCache.get("thumb_${uriString}_${pageIndex}_${if (smartDarkInvert) 1 else 0}")
+        ?.takeIf { !it.isRecycled }
+
+    fun getCachedCropBounds(uriString: String, pageIndex: Int): RectF? =
+        cropBoundsCache.get("${uriString}_$pageIndex")
+
+    @Suppress("DEPRECATION")
     fun trimMemory(level: Int) {
         when {
-            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_MODERATE -> bitmapCache.evictAll()
-            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND -> bitmapCache.trimToSize(maxCacheKb / 2)
+            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_MODERATE ||
+                level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> {
+                bitmapCache.evictAll()
+                thumbnailCache.evictAll()
+            }
+            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
+                level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
+                bitmapCache.trimToSize(maxCacheKb / 2)
+                thumbnailCache.trimToSize(maxThumbKb / 2)
+            }
         }
     }
 
@@ -90,49 +142,118 @@ object PdfPageEngine {
         targetWidthPx: Int,
         smartDarkInvert: Boolean = false
     ): Bitmap? = withContext(Dispatchers.IO) {
-        val widthBucket = ((targetWidthPx.coerceIn(280, 3200) + 127) / 128) * 128
-        val cacheKey = "${uriString}_${pageIndex}_${widthBucket}_${if (smartDarkInvert) 1 else 0}"
+        val widthBucket = bucketWidth(targetWidthPx)
+        val cacheKey = pageCacheKey(uriString, pageIndex, widthBucket, smartDarkInvert)
         bitmapCache.get(cacheKey)?.let { cached ->
             if (!cached.isRecycled) return@withContext cached
         }
 
-        val rendered = rendererMutex.withLock {
+        rendererMutex.withLock {
             bitmapCache.get(cacheKey)?.let { cached ->
                 if (!cached.isRecycled) return@withLock cached
             }
-            val pfd = openFileDescriptor(context, uriString) ?: return@withLock null
-            pfd.use { fd ->
-                PdfRenderer(fd).use { renderer ->
-                    if (pageIndex !in 0 until renderer.pageCount) return@withLock null
-                    renderer.openPage(pageIndex).use { page ->
-                        val aspect = page.height.toFloat() / page.width.coerceAtLeast(1).toFloat()
-                        val w = widthBucket
-                        val h = (w * aspect).roundToInt().coerceIn(200, 4200)
-                        val rawBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                        Canvas(rawBmp).drawColor(Color.WHITE)
-                        page.render(rawBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            renderPageInternal(context, uriString, pageIndex, widthBucket, smartDarkInvert)?.also { finalBmp ->
+                bitmapCache.put(cacheKey, finalBmp)
+            }
+        }
+    }
 
-                        val finalBmp = if (smartDarkInvert) {
-                            applySmartDarkInvert(rawBmp)
-                        } else {
-                            rawBmp
+    suspend fun renderThumbnailBitmap(
+        context: Context,
+        uriString: String,
+        pageIndex: Int,
+        smartDarkInvert: Boolean = false,
+        thumbWidthPx: Int = 220
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val key = "thumb_${uriString}_${pageIndex}_${if (smartDarkInvert) 1 else 0}"
+        thumbnailCache.get(key)?.let { cached ->
+            if (!cached.isRecycled) return@withContext cached
+        }
+        thumbMutex.withLock {
+            thumbnailCache.get(key)?.let { cached ->
+                if (!cached.isRecycled) return@withLock cached
+            }
+            rendererMutex.withLock {
+                renderPageInternal(
+                    context = context,
+                    uriString = uriString,
+                    pageIndex = pageIndex,
+                    targetWidthPx = thumbWidthPx.coerceIn(140, 280),
+                    smartDarkInvert = smartDarkInvert
+                )?.also { bmp ->
+                    thumbnailCache.put(key, bmp)
+                }
+            }
+        }
+    }
+
+    private fun renderPageInternal(
+        context: Context,
+        uriString: String,
+        pageIndex: Int,
+        targetWidthPx: Int,
+        smartDarkInvert: Boolean
+    ): Bitmap? {
+        val pfd = openFileDescriptor(context, uriString) ?: return null
+        return pfd.use { fd ->
+            PdfRenderer(fd).use { renderer ->
+                if (pageIndex !in 0 until renderer.pageCount) return@use null
+                renderer.openPage(pageIndex).use { page ->
+                    val aspect = page.height.toFloat() / page.width.coerceAtLeast(1).toFloat()
+                    val w = targetWidthPx.coerceIn(140, 2200)
+                    val h = (w * aspect).roundToInt().coerceIn(160, 3200)
+
+                    val rawBmp = allocateBitmapWithRecovery(w, h) ?: return@use null
+                    Canvas(rawBmp).drawColor(Color.WHITE)
+                    page.render(rawBmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+
+                    if (smartDarkInvert) {
+                        val inverted = applySmartDarkInvert(rawBmp)
+                        if (inverted !== rawBmp && !rawBmp.isRecycled) {
+                            rawBmp.recycle()
                         }
-                        bitmapCache.put(cacheKey, finalBmp)
-                        finalBmp
+                        inverted
+                    } else {
+                        rawBmp
                     }
                 }
             }
         }
-        rendered
+    }
+
+    private fun allocateBitmapWithRecovery(width: Int, height: Int): Bitmap? {
+        return try {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        } catch (_: OutOfMemoryError) {
+            bitmapCache.trimToSize(maxCacheKb / 4)
+            thumbnailCache.evictAll()
+            System.gc()
+            try {
+                Bitmap.createBitmap((width * 0.75f).roundToInt(), (height * 0.75f).roundToInt(), Bitmap.Config.ARGB_8888)
+            } catch (_: OutOfMemoryError) {
+                null
+            }
+        }
+    }
+
+    suspend fun getOrComputeContentBounds(
+        uriString: String,
+        pageIndex: Int,
+        bitmap: Bitmap
+    ): RectF = withContext(Dispatchers.Default) {
+        val key = "${uriString}_$pageIndex"
+        cropBoundsCache.get(key)?.let { return@withContext it }
+        detectNormalizedContentBounds(bitmap).also { rect ->
+            cropBoundsCache.put(key, rect)
+        }
     }
 
     /**
      * Produces a dark-mode friendly inversion with warm charcoal paper & preserved hue readability.
      */
     fun applySmartDarkInvert(source: Bitmap): Bitmap {
-        val out = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+        val out = allocateBitmapWithRecovery(source.width, source.height) ?: return source
         val canvas = Canvas(out)
-        // Hue-preserving lightness inversion filter
         val invertMatrix = ColorMatrix(
             floatArrayOf(
                 -0.88f, 0f, 0f, 0f, 240f,
@@ -153,6 +274,7 @@ object PdfPageEngine {
      * (`0f..1f` LTRB) for Auto Margin Crop or smart double-tap column zooming.
      */
     fun detectNormalizedContentBounds(bitmap: Bitmap): RectF {
+        if (bitmap.isRecycled) return RectF(0f, 0f, 1f, 1f)
         val w = bitmap.width
         val h = bitmap.height
         if (w < 16 || h < 16) return RectF(0f, 0f, 1f, 1f)
@@ -174,8 +296,7 @@ object PdfPageEngine {
                 val g = Color.green(pixel)
                 val b = Color.blue(pixel)
                 val lum = (r * 299 + g * 587 + b * 114) / 1000
-                // Treat non-near-white and non-near-pure-black background margins as ink
-                if (lum in 15..240) {
+                if (lum < 242) {
                     foundInk = true
                     if (x < minX) minX = x
                     if (x > maxX) maxX = x

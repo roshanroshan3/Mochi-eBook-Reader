@@ -37,10 +37,11 @@ import com.example.ui.theme.LocalMochiPalette
 fun PrivacyScreen(onBack: () -> Unit) {
     val palette = LocalMochiPalette.current
     val items = listOf(
-        "Zero Network Access" to "Mochi does not declare android.permission.INTERNET. Nothing ever leaves your device.",
+        "Local-First Reading & Notes" to "Reading sessions, highlights, bookmarks, CAD markups, and theme settings stay strictly in Mochi's local SQLite & DataStore storage.",
+        "Optional Project Gutenberg Access" to "Network permission (INTERNET) is used exclusively when you choose to browse, preview covers, or download free public-domain ebooks from Project Gutenberg via Gutendex.",
         "Zero Accounts or Telemetry" to "No sign-in, no analytics, no crash trackers, and no ads.",
-        "Scoped Storage Access (SAF)" to "Mochi only reads folders and files you explicitly pick through Android's Storage Access Framework.",
-        "Non-Destructive Guarantee" to "Mochi never modifies your original EPUB, PDF, CBZ, Markdown, or TXT files. All library metadata, shelves, and future annotations stay in Mochi's local SQLite database."
+        "Scoped Storage Access (SAF)" to "Mochi only reads local folders and files you explicitly pick through Android's Storage Access Framework.",
+        "Non-Destructive Guarantee" to "Mochi never modifies your original EPUB, PDF, CBZ, Markdown, or TXT files."
     )
 
     Box(
@@ -107,8 +108,9 @@ fun CreditsScreen(onBack: () -> Unit) {
         CreditEntry("AGSL RuntimeShader & Compose GraphicsLayer", "Interactive GPU Page Curl & Liquid Glass Specular Shading", "Android Graphics Shading Language (API 33+) & Compose Canvas Fallback"),
         CreditEntry("CAD Vector Studio (SVG / JSON)", "Layered Vector Markups & Non-Destructive CAD Exports", "Open SVG 1.1 & Portable JSON Formats"),
         CreditEntry("Jetpack Compose, Material 3, Room, DataStore, Navigation, WorkManager, DocumentFile", "AndroidX Libraries", "Apache License 2.0"),
-        CreditEntry("Coil", "Image Caching & Loading", "Apache License 2.0"),
-        CreditEntry("Moshi", "Theme Pack JSON Serialization", "Apache License 2.0"),
+        CreditEntry("Project Gutenberg & Gutendex API", "Public-Domain Free Ebook Catalog", "Public Domain Books & MIT Gutendex API"),
+        CreditEntry("Coil & OkHttp", "Image Caching & Ebook Catalog Networking", "Apache License 2.0"),
+        CreditEntry("Moshi", "Theme Pack & Catalog JSON Serialization", "Apache License 2.0"),
         CreditEntry("Material Symbols / Icons", "UI Iconography", "Apache License 2.0")
     )
 

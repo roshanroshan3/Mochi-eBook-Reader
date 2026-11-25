@@ -64,7 +64,7 @@ data class BookEntity(
     val shelfOrder: Int = 0,
     val fileSizeBytes: Long = 0L,
     val pageCountEstimate: Int = 220,
-    val folderTreeUri: String = "samples://local",
+    val folderTreeUri: String = "imported://documents",
     val relativeFolderPath: String = "",
     val hidden: Boolean = false,
     val stackId: String? = null,

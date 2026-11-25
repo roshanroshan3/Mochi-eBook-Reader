@@ -9,7 +9,6 @@ import com.example.data.db.MarkupObjectEntity
 import com.example.data.db.MochiDatabase
 import com.example.data.db.PageScaleEntity
 import com.example.data.library.SafBookScanner
-import com.example.data.library.SampleBookSeeder
 import com.example.data.studio.AnnotationStudioRepository
 import com.example.data.studio.MeasurementUnit
 import com.example.data.studio.SnapKind
@@ -160,11 +159,18 @@ class AnnotationStudioAndPdfTest {
 
     @Test
     fun roomStudioLayersMarkupsSvgAndAnnotatedPdfCopyPreserveOriginalFileSha256() = runTest {
-        val samples = SampleBookSeeder.seedIfNeeded(context)
+        val samples = TestBookFixtures.createAll(context)
         val pdfSample = samples.first { it.file.name.endsWith(".pdf", ignoreCase = true) }
         val hashBefore = sha256Hex(pdfSample.file)
 
-        val bookEntity = SafBookScanner.scanSeededSample(context, pdfSample, existing = null, shelfOrder = 0)
+        val bookEntity = SafBookScanner.scanLocalBookFile(
+            context = context,
+            file = pdfSample.file,
+            existing = null,
+            shelfOrder = 0,
+            fallbackTitle = pdfSample.title,
+            fallbackAuthors = pdfSample.authors
+        )
         val bookId = db.bookDao().upsertBook(bookEntity)
 
         val defaultLayers = repo.ensureDefaultLayers(bookId)

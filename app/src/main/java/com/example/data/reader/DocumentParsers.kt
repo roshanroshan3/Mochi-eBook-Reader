@@ -45,13 +45,17 @@ object DocumentParsers {
             BookFormat.CBZ -> parseCbz(book, streamOpener)
             BookFormat.PDF -> {
                 val summary = PdfPageEngine.inspectPdf(context, book.uri)
+                val outlineTitles = runCatching {
+                    PdfReflowExtractor.extractOutlineTitlesFromUri(context, book.uri)
+                }.getOrDefault(emptyMap())
                 val chapters = summary.pageSizes.mapIndexed { idx, (w, h) ->
+                    val label = outlineTitles[idx] ?: "Page ${idx + 1} (${w}×${h} pt)"
                     ReaderChapter(
                         index = idx,
                         id = "pdf_page_$idx",
-                        title = "Page ${idx + 1} (${w}×${h} pt)",
+                        title = label,
                         blocks = listOf(ContentBlock.Paragraph(StyledText("PDF Page ${idx + 1}"))),
-                        plainText = "Page ${idx + 1}"
+                        plainText = label
                     )
                 }
                 ParsedDocument(
@@ -86,16 +90,51 @@ object DocumentParsers {
     }
 
     // =========================================================================
-    // EPUB 2 / 3 PARSER
+    // EPUB 2 / 3 PARSER (Memory-bounded: avoids buffering huge archive images)
     // =========================================================================
+    private const val MAX_INLINE_EPUB_IMAGE_BYTES = 4 * 1024 * 1024
+    private const val MAX_INLINE_CBZ_IMAGE_BYTES = 2 * 1024 * 1024
+
+    private fun isImageAssetPath(path: String): Boolean {
+        val lower = path.lowercase()
+        return lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+            lower.endsWith(".webp") || lower.endsWith(".gif")
+    }
+
     private fun parseEpub(book: BookEntity, streamOpener: () -> InputStream?): ParsedDocument {
         val entries = mutableMapOf<String, ByteArray>()
+        val images = mutableMapOf<String, ByteArray>()
+        val archiveImageKeys = linkedSetOf<String>()
+        var inlineImageBytes = 0
+
         streamOpener()?.use { raw ->
             ZipInputStream(BufferedInputStream(raw)).use { zip ->
                 var entry: ZipEntry? = zip.nextEntry
                 while (entry != null) {
                     if (!entry.isDirectory) {
-                        entries[entry.name] = zip.readBytes()
+                        val name = entry.name
+                        if (isImageAssetPath(name)) {
+                            archiveImageKeys.add(name)
+                            archiveImageKeys.add(name.substringAfterLast('/'))
+                            val entryLen = entry.size.takeIf { it > 0L }?.toInt()
+                            if (inlineImageBytes < MAX_INLINE_EPUB_IMAGE_BYTES &&
+                                (entryLen == null || inlineImageBytes + entryLen <= MAX_INLINE_EPUB_IMAGE_BYTES)
+                            ) {
+                                val bytes = zip.readBytes()
+                                if (inlineImageBytes + bytes.size <= MAX_INLINE_EPUB_IMAGE_BYTES) {
+                                    images[name] = bytes
+                                    images[name.substringAfterLast('/')] = bytes
+                                    inlineImageBytes += bytes.size
+                                }
+                            }
+                        } else {
+                            val lower = name.lowercase()
+                            if (lower.endsWith(".opf") || lower.endsWith(".ncx") || lower.endsWith(".xml") ||
+                                lower.endsWith(".xhtml") || lower.endsWith(".html") || lower.endsWith(".htm")
+                            ) {
+                                entries[name] = zip.readBytes()
+                            }
+                        }
                     }
                     zip.closeEntry()
                     entry = zip.nextEntry
@@ -171,7 +210,6 @@ object DocumentParsers {
             parseHtmlNavTitles(entries[resolvedNavPath]!!, tocTitles)
         }
 
-        val images = mutableMapOf<String, ByteArray>()
         val footnotes = mutableMapOf<String, FootnoteEntry>()
         val chapters = mutableListOf<ReaderChapter>()
 
@@ -179,15 +217,6 @@ object DocumentParsers {
             spineIds.mapNotNull { manifest[it]?.first }.map { resolvePath(opfDir, it) }
         } else {
             entries.keys.filter { it.endsWith(".xhtml", true) || it.endsWith(".html", true) }.sorted()
-        }
-
-        // Register all images in the archive
-        entries.forEach { (path, bytes) ->
-            val lower = path.lowercase()
-            if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp")) {
-                images[path] = bytes
-                images[path.substringAfterLast('/')] = bytes
-            }
         }
 
         spinePaths.forEachIndexed { idx, chapterPath ->
@@ -226,7 +255,9 @@ object DocumentParsers {
             authors = docAuthor,
             chapters = chapters,
             footnotes = footnotes,
-            images = images
+            images = images,
+            archiveImageKeys = archiveImageKeys,
+            bookUri = book.uri
         )
     }
 
@@ -832,20 +863,37 @@ object DocumentParsers {
 
     private fun parseCbz(book: BookEntity, streamOpener: () -> InputStream?): ParsedDocument {
         val images = mutableMapOf<String, ByteArray>()
+        val imageKeys = mutableListOf<String>()
+        var inlineImageBytes = 0
+
         streamOpener()?.use { raw ->
             ZipInputStream(BufferedInputStream(raw)).use { zip ->
                 var entry: ZipEntry? = zip.nextEntry
                 while (entry != null) {
-                    val lower = entry.name.lowercase()
-                    if (!entry.isDirectory && (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp"))) {
-                        images[entry.name] = zip.readBytes()
+                    val name = entry.name
+                    if (!entry.isDirectory && isImageAssetPath(name)) {
+                        imageKeys.add(name)
+                        val entryLen = entry.size.takeIf { it > 0L }?.toInt()
+                        if (inlineImageBytes < MAX_INLINE_CBZ_IMAGE_BYTES &&
+                            (entryLen == null || inlineImageBytes + entryLen <= MAX_INLINE_CBZ_IMAGE_BYTES)
+                        ) {
+                            val bytes = zip.readBytes()
+                            if (inlineImageBytes + bytes.size <= MAX_INLINE_CBZ_IMAGE_BYTES) {
+                                images[name] = bytes
+                                inlineImageBytes += bytes.size
+                            } else {
+                                // Archive exceeds inline budget; clear inline cache and stream per-page lazily
+                                images.clear()
+                                inlineImageBytes = MAX_INLINE_CBZ_IMAGE_BYTES
+                            }
+                        }
                     }
                     zip.closeEntry()
                     entry = zip.nextEntry
                 }
             }
         }
-        val sortedKeys = images.keys.sorted()
+        val sortedKeys = imageKeys.sorted()
         val chapters = sortedKeys.mapIndexed { idx, key ->
             ReaderChapter(
                 index = idx,
@@ -862,7 +910,9 @@ object DocumentParsers {
                 listOf(ReaderChapter(0, "empty", book.title, listOf(ContentBlock.Paragraph(StyledText("No pages found in comic archive."))), ""))
             },
             images = images,
-            isComic = true
+            archiveImageKeys = sortedKeys.toSet(),
+            isComic = true,
+            bookUri = book.uri
         )
     }
 

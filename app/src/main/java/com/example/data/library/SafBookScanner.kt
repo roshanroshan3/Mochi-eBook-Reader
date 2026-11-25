@@ -159,13 +159,17 @@ object SafBookScanner {
         )
     }
 
-    suspend fun scanSeededSample(
+    suspend fun scanLocalBookFile(
         context: Context,
-        sample: SeededSampleFile,
+        file: File,
         existing: BookEntity?,
-        shelfOrder: Int
+        shelfOrder: Int,
+        folderTreeUri: String = "imported://documents",
+        relativeFolderPath: String = "",
+        fallbackTitle: String? = null,
+        fallbackAuthors: String? = null,
+        coverPathOverride: String? = null
     ): BookEntity = withContext(Dispatchers.IO) {
-        val file = sample.file
         val uriStr = Uri.fromFile(file).toString()
         val format = BookFormat.fromFilename(file.name) ?: BookFormat.TXT
         val hash = computeSha256 { FileInputStream(file) }
@@ -178,34 +182,41 @@ object SafBookScanner {
             streamProvider = { FileInputStream(file) },
             pfdProvider = { ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY) }
         )
-        val status = when {
-            sample.progress >= 0.99f -> ReadingStatus.FINISHED
-            sample.progress > 0f -> ReadingStatus.READING
-            else -> ReadingStatus.UNREAD
+        val resolvedTitle = when {
+            !fallbackTitle.isNullOrBlank() && (meta.title.isBlank() || meta.title.startsWith("Pg ")) -> fallbackTitle
+            meta.title.isNotBlank() -> meta.title
+            !fallbackTitle.isNullOrBlank() -> fallbackTitle
+            else -> file.nameWithoutExtension
+        }
+        val resolvedAuthors = when {
+            !fallbackAuthors.isNullOrBlank() && (meta.authors.isBlank() || meta.authors == "Unknown Author" || meta.authors == "PDF Document") -> fallbackAuthors
+            meta.authors.isNotBlank() -> meta.authors
+            !fallbackAuthors.isNullOrBlank() -> fallbackAuthors
+            else -> "Unknown Author"
         }
         BookEntity(
             id = existing?.id ?: 0L,
             uri = uriStr,
             contentHash = hash,
-            title = meta.title.ifBlank { sample.title },
-            authors = meta.authors.ifBlank { sample.authors },
-            series = meta.series ?: sample.series,
-            seriesIndex = meta.seriesIndex ?: sample.seriesIndex,
+            title = resolvedTitle,
+            authors = resolvedAuthors,
+            series = meta.series ?: existing?.series,
+            seriesIndex = meta.seriesIndex ?: existing?.seriesIndex,
             format = format,
-            coverPath = meta.coverPath,
+            coverPath = meta.coverPath ?: coverPathOverride ?: existing?.coverPath,
             addedAt = existing?.addedAt ?: System.currentTimeMillis(),
-            lastOpenedAt = existing?.lastOpenedAt ?: sample.lastOpenedOffsetMs,
-            progress = existing?.progress ?: sample.progress,
-            status = existing?.status ?: status,
+            lastOpenedAt = existing?.lastOpenedAt,
+            progress = existing?.progress ?: 0f,
+            status = existing?.status ?: ReadingStatus.UNREAD,
             shelfOrder = existing?.shelfOrder ?: shelfOrder,
             fileSizeBytes = file.length(),
             pageCountEstimate = meta.pageCountEstimate,
-            folderTreeUri = "samples://local",
-            relativeFolderPath = sample.relativeFolder,
+            folderTreeUri = folderTreeUri,
+            relativeFolderPath = relativeFolderPath,
             hidden = existing?.hidden ?: false,
             stackId = existing?.stackId,
             stackTitle = existing?.stackTitle,
-            isSample = true
+            isSample = false
         )
     }
 

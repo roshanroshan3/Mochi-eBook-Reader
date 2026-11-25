@@ -14,13 +14,12 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -46,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +63,8 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
@@ -78,6 +80,8 @@ import androidx.compose.ui.unit.dp
 import com.example.theme.ContrastChecker
 import com.example.ui.theme.LocalGlassConfig
 import com.example.ui.theme.LocalMochiPalette
+import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 /**
@@ -135,12 +139,25 @@ fun LiquidGlassSurface(
         }
     }
 
-    val blurDp = remember(palette, glassConfig, freezeBlur, isSolid) {
-        if (isSolid || freezeBlur || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            0.dp
-        } else {
-            (palette.blurRadiusDp * glassConfig.intensity.blurMultiplier).coerceIn(0f, 22f).dp
-        }
+    val shaderColor = Color(palette.glassHighlight)
+    val cachedLensShader = remember(palette.glassHighlight, isSolid) {
+        if (!isSolid && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            runCatching {
+                RuntimeShader(
+                    """
+                    uniform float2 size;
+                    uniform half4 highlightColor;
+                    half4 main(float2 fragCoord) {
+                        float yNorm = fragCoord.y / max(size.y, 1.0);
+                        float topBand = smoothstep(0.45, 0.0, yNorm);
+                        return half4(highlightColor.rgb, highlightColor.a * topBand * 0.22);
+                    }
+                    """.trimIndent()
+                ).apply {
+                    setFloatUniform("highlightColor", shaderColor.red, shaderColor.green, shaderColor.blue, shaderColor.alpha)
+                }
+            }.getOrNull()
+        } else null
     }
 
     Box(
@@ -153,36 +170,17 @@ fun LiquidGlassSurface(
             )
             .clip(shape)
     ) {
-        // Frosted glass backdrop layer (blurred only behind text/content)
+        // Frosted glass backdrop layer with zero-allocation optical specular sheen
         Box(
             modifier = Modifier
                 .matchParentSize()
-                .then(if (blurDp > 0.dp) Modifier.blur(blurDp) else Modifier)
                 .background(baseFill)
                 .drawBehind {
-                    if (!isSolid) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            val lensShader = runCatching {
-                                RuntimeShader(
-                                    """
-                                    uniform float2 size;
-                                    uniform half4 highlightColor;
-                                    half4 main(float2 fragCoord) {
-                                        float yNorm = fragCoord.y / max(size.y, 1.0);
-                                        float topBand = smoothstep(0.45, 0.0, yNorm);
-                                        return half4(highlightColor.rgb, highlightColor.a * topBand * 0.22);
-                                    }
-                                    """.trimIndent()
-                                ).apply {
-                                    setFloatUniform("size", size.width, size.height)
-                                    val c = Color(palette.glassHighlight)
-                                    setFloatUniform("highlightColor", c.red, c.green, c.blue, c.alpha)
-                                }
-                            }.getOrNull()
-                            if (lensShader != null) {
-                                drawRect(brush = ShaderBrush(lensShader))
-                                return@drawBehind
-                            }
+                    if (!isSolid && !freezeBlur) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && cachedLensShader != null) {
+                            cachedLensShader.setFloatUniform("size", size.width, size.height)
+                            drawRect(brush = ShaderBrush(cachedLensShader))
+                            return@drawBehind
                         }
                         drawRect(
                             brush = Brush.verticalGradient(
@@ -329,11 +327,19 @@ fun LiquidGlassPill(
     }
 }
 
+object LiquidGlassSliderMath {
+    fun fractionForX(xPx: Float, totalWidthPx: Float, thumbSizePx: Float): Float {
+        val usable = (totalWidthPx - thumbSizePx).coerceAtLeast(1f)
+        return ((xPx - thumbSizePx * 0.5f) / usable).coerceIn(0f, 1f)
+    }
+}
+
 /**
  * Liquid Glass Slider replacing stock Material Sliders:
  * - Translucent frosted pill track with specular edge highlight (or crisp solid tone when solidChrome = true).
  * - Accent gradient active fill + optional chapter/snap tick markers.
  * - Floating refractive glass orb thumb that smoothly expands while scrubbing.
+ * - Unified gesture detector with immediate thumb lock + updated closure references.
  * - Minimum 48dp accessible touch height & full semantics support.
  */
 @Composable
@@ -357,6 +363,8 @@ fun LiquidGlassSlider(
 
     var isDragging by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(clampedFraction) }
+    var sliderWidthPx by remember { mutableFloatStateOf(0f) }
+
     val activeFraction = if (isDragging) dragFraction else clampedFraction
     val animatedFraction by animateFloatAsState(targetValue = activeFraction, label = "glass_slider_frac")
     val displayFraction = if (isDragging) activeFraction else animatedFraction
@@ -369,6 +377,13 @@ fun LiquidGlassSlider(
         targetValue = if (isDragging) 14.dp else 10.dp,
         label = "glass_track_height"
     )
+    val thumbSizePx = with(density) { thumbDiameter.toPx() }
+
+    val currentOnValueChange by rememberUpdatedState(onValueChange)
+    val currentOnFinished by rememberUpdatedState(onValueChangeFinished)
+    val currentRange by rememberUpdatedState(valueRange)
+    val currentFractionState by rememberUpdatedState(activeFraction)
+    val thumbSizeState by rememberUpdatedState(thumbSizePx)
 
     val trackBg = remember(palette, isSolid) {
         if (isSolid) {
@@ -382,10 +397,11 @@ fun LiquidGlassSlider(
         else Color(palette.glassHighlight).copy(alpha = 0.72f)
     }
 
-    BoxWithConstraints(
+    Box(
         modifier = modifier
             .fillMaxWidth()
             .defaultMinSize(minHeight = 48.dp)
+            .onSizeChanged { sliderWidthPx = it.width.toFloat() }
             .semantics(mergeDescendants = true) {
                 progressBarRangeInfo = ProgressBarRangeInfo(
                     current = value.coerceIn(valueRange.start, valueRange.endInclusive),
@@ -393,54 +409,98 @@ fun LiquidGlassSlider(
                 )
                 if (enabled) {
                     setProgress { target ->
-                        val next = target.coerceIn(valueRange.start, valueRange.endInclusive)
-                        onValueChange(next)
-                        onValueChangeFinished?.invoke()
+                        val next = target.coerceIn(currentRange.start, currentRange.endInclusive)
+                        currentOnValueChange(next)
+                        currentOnFinished?.invoke()
                         true
                     }
                 }
             }
-            .pointerInput(enabled, valueRange) {
+            .pointerInput(enabled) {
                 if (!enabled) return@pointerInput
-                detectTapGestures { offset ->
-                    val frac = (offset.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
-                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    onValueChange(valueRange.start + frac * span)
-                    onValueChangeFinished?.invoke()
-                }
-            }
-            .pointerInput(enabled, valueRange) {
-                if (!enabled) return@pointerInput
-                detectHorizontalDragGestures(
-                    onDragStart = { startOffset ->
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val widthPx = size.width.toFloat().coerceAtLeast(1f)
+                    val tSize = thumbSizeState
+                    val usable = (widthPx - tSize).coerceAtLeast(1f)
+                    val thumbCenter = (tSize * 0.5f) + currentFractionState * usable
+                    val startedOnThumb = abs(down.position.x - thumbCenter) <= (viewConfiguration.touchSlop * 1.5f + tSize * 0.65f)
+
+                    var dragLocked = startedOnThumb
+                    var lastFrac = currentFractionState
+                    if (dragLocked) {
+                        down.consume()
                         isDragging = true
-                        val frac = (startOffset.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                        val frac = LiquidGlassSliderMath.fractionForX(down.position.x, widthPx, tSize)
+                        lastFrac = frac
+                        dragFraction = frac
+                        val r = currentRange
+                        val rSpan = (r.endInclusive - r.start).takeIf { it > 1e-6f } ?: 1f
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        currentOnValueChange(r.start + frac * rSpan)
+                    }
+
+                    var totalDx = 0f
+                    var totalDy = 0f
+                    var releasedCleanly = false
+
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                            ?: event.changes.firstOrNull()
+                            ?: break
+                        if (!change.pressed) {
+                            releasedCleanly = !change.isConsumed || dragLocked
+                            if (dragLocked) change.consume()
+                            break
+                        }
+
+                        val delta = change.positionChange()
+                        totalDx += delta.x
+                        totalDy += delta.y
+
+                        if (!dragLocked) {
+                            if (change.isConsumed) break
+                            val hSlop = viewConfiguration.touchSlop * 0.45f
+                            if (abs(totalDx) >= hSlop && abs(totalDx) >= abs(totalDy) * 0.55f) {
+                                dragLocked = true
+                                isDragging = true
+                                change.consume()
+                            } else if (abs(totalDy) > viewConfiguration.touchSlop * 1.35f && abs(totalDy) > abs(totalDx) * 1.8f) {
+                                break
+                            }
+                        }
+
+                        if (dragLocked) {
+                            change.consume()
+                            val frac = LiquidGlassSliderMath.fractionForX(change.position.x, widthPx, tSize)
+                            val crossedEnd = (lastFrac > 0.01f && frac <= 0.005f) || (lastFrac < 0.99f && frac >= 0.995f)
+                            if (crossedEnd) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            lastFrac = frac
+                            dragFraction = frac
+                            val r = currentRange
+                            val rSpan = (r.endInclusive - r.start).takeIf { it > 1e-6f } ?: 1f
+                            currentOnValueChange(r.start + frac * rSpan)
+                        }
+                    }
+
+                    if (dragLocked) {
+                        isDragging = false
+                        currentOnFinished?.invoke()
+                    } else if (releasedCleanly && hypot(totalDx, totalDy) <= viewConfiguration.touchSlop * 1.25f) {
+                        val frac = LiquidGlassSliderMath.fractionForX(down.position.x, widthPx, tSize)
+                        val r = currentRange
+                        val rSpan = (r.endInclusive - r.start).takeIf { it > 1e-6f } ?: 1f
                         dragFraction = frac
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onValueChange(valueRange.start + frac * span)
-                    },
-                    onHorizontalDrag = { change, _ ->
-                        change.consume()
-                        val frac = (change.position.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
-                        val crossedEnd = (dragFraction > 0.01f && frac <= 0.005f) || (dragFraction < 0.99f && frac >= 0.995f)
-                        if (crossedEnd) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        dragFraction = frac
-                        onValueChange(valueRange.start + frac * span)
-                    },
-                    onDragEnd = {
-                        isDragging = false
-                        onValueChangeFinished?.invoke()
-                    },
-                    onDragCancel = {
-                        isDragging = false
-                        onValueChangeFinished?.invoke()
+                        currentOnValueChange(r.start + frac * rSpan)
+                        currentOnFinished?.invoke()
                     }
-                )
+                }
             },
         contentAlignment = Alignment.CenterStart
     ) {
-        val totalWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
-        val thumbSizePx = with(density) { thumbDiameter.toPx() }
+        val totalWidthPx = sliderWidthPx.coerceAtLeast(thumbSizePx + 1f)
         val usablePx = (totalWidthPx - thumbSizePx).coerceAtLeast(1f)
         val thumbCenterX = (thumbSizePx / 2f) + displayFraction * usablePx
 

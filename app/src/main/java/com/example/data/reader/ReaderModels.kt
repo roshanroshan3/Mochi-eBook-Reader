@@ -68,6 +68,7 @@ data class ParsedDocument(
     val chapters: List<ReaderChapter>,
     val footnotes: Map<String, FootnoteEntry> = emptyMap(),
     val images: Map<String, ByteArray> = emptyMap(),
+    val archiveImageKeys: Set<String> = emptySet(),
     val backlinks: List<BookEntity> = emptyList(),
     val isMarkdown: Boolean = false,
     val isComic: Boolean = false,

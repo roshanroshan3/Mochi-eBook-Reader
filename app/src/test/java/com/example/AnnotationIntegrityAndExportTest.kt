@@ -14,7 +14,6 @@ import com.example.data.annotations.HighlightStyle
 import com.example.data.annotations.QuoteCardGenerator
 import com.example.data.db.MochiDatabase
 import com.example.data.library.SafBookScanner
-import com.example.data.library.SampleBookSeeder
 import com.example.data.preferences.AutoDarkMode
 import com.example.data.preferences.MochiPreferences
 import com.example.data.reader.ReaderLocator
@@ -76,14 +75,21 @@ class AnnotationIntegrityAndExportTest {
 
     @Test
     fun creatingEditingExportingAndDeletingAnnotationsNeverModifiesOriginalBookFiles() = runTest {
-        val samples = SampleBookSeeder.seedIfNeeded(context)
+        val samples = TestBookFixtures.createAll(context)
         assertTrue(samples.isNotEmpty())
 
         // Record SHA-256 of every original file before touching annotations
         val hashesBefore = samples.associate { it.file.absolutePath to sha256Hex(it.file) }
 
         val bookIds = samples.mapIndexed { idx, sample ->
-            val entity = SafBookScanner.scanSeededSample(context, sample, existing = null, shelfOrder = idx)
+            val entity = SafBookScanner.scanLocalBookFile(
+                context = context,
+                file = sample.file,
+                existing = null,
+                shelfOrder = idx,
+                fallbackTitle = sample.title,
+                fallbackAuthors = sample.authors
+            )
             db.bookDao().upsertBook(entity)
         }
         val firstBookId = bookIds.first()
@@ -177,11 +183,14 @@ class AnnotationIntegrityAndExportTest {
 
     @Test
     fun exporterSubstitutesAllTemplatePlaceholdersAndCitationCopy() = runTest {
-        val book = SafBookScanner.scanSeededSample(
+        val firstFixture = TestBookFixtures.createAll(context).first()
+        val book = SafBookScanner.scanLocalBookFile(
             context = context,
-            sample = SampleBookSeeder.seedIfNeeded(context).first(),
+            file = firstFixture.file,
             existing = null,
-            shelfOrder = 0
+            shelfOrder = 0,
+            fallbackTitle = firstFixture.title,
+            fallbackAuthors = firstFixture.authors
         ).copy(id = 99L)
 
         val tpl = "T={{title}}|A={{author}}|C={{chapter}}|P={{page}}|Q={{quote}}|N={{note}}|K={{color}}|G={{tags}}|D={{date}}"

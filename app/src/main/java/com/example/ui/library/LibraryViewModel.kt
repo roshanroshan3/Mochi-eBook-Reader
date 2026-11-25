@@ -13,7 +13,9 @@ import com.example.data.db.CollectionEntity
 import com.example.data.db.FolderEntity
 import com.example.data.db.ReadingStatus
 import com.example.data.db.TagEntity
+import com.example.data.library.GutenbergBook
 import com.example.data.stats.ReadingInsights
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -80,13 +82,29 @@ data class LibraryUiState(
     val eventMessage: String? = null
 )
 
+data class GutenbergCatalogState(
+    val query: String = "",
+    val selectedTopic: String = "Popular",
+    val books: List<GutenbergBook> = emptyList(),
+    val totalCount: Int = 0,
+    val nextUrl: String? = null,
+    val isLoading: Boolean = false,
+    val isLoadingMore: Boolean = false,
+    val errorMessage: String? = null,
+    val downloadProgress: Map<Int, Float> = emptyMap(),
+    val downloadedBookIds: Map<Int, Long> = emptyMap()
+)
+
 class LibraryViewModel(application: Application) : AndroidViewModel(application) {
     private val container = (application as MochiApplication).container
     private val repository = container.libraryRepository
+    private val gutenbergRepository = container.gutenbergRepository
     private val statsRepository = container.readingStatsRepository
 
     private val _filter = MutableStateFlow(LibraryFilterState())
     private val _eventMessage = MutableStateFlow<String?>(null)
+    private val _gutenbergRaw = MutableStateFlow(GutenbergCatalogState())
+    private var gutenbergJob: Job? = null
 
     private data class RepoSnapshot(
         val books: List<BookEntity>,
@@ -191,6 +209,25 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = LibraryUiState()
+    )
+
+    val gutenbergState: StateFlow<GutenbergCatalogState> = combine(
+        _gutenbergRaw,
+        repository.allBooksIncludingHidden
+    ) { catalog, allBooks ->
+        val regex = Regex("pg_(\\d+)\\.")
+        val downloadedMap = buildMap<Int, Long> {
+            allBooks.forEach { book ->
+                val match = regex.find(book.uri)
+                val gid = match?.groupValues?.getOrNull(1)?.toIntOrNull()
+                if (gid != null) put(gid, book.id)
+            }
+        }
+        catalog.copy(downloadedBookIds = downloadedMap)
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = GutenbergCatalogState()
     )
 
     private fun buildShelfGroups(books: List<BookEntity>): List<BookStackGroup> {
@@ -374,5 +411,123 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     fun removeTagFromBook(bookId: Long, tagId: Long) = viewModelScope.launch {
         repository.removeTagFromBook(bookId, tagId)
+    }
+
+    fun openGutenbergCatalogIfNeeded() {
+        val current = _gutenbergRaw.value
+        if (current.books.isEmpty() && !current.isLoading) {
+            searchGutenberg(current.query, current.selectedTopic)
+        }
+    }
+
+    fun setGutenbergQuery(query: String) {
+        _gutenbergRaw.update { it.copy(query = query) }
+    }
+
+    fun searchGutenberg(
+        query: String = _gutenbergRaw.value.query,
+        topic: String = _gutenbergRaw.value.selectedTopic
+    ) {
+        gutenbergJob?.cancel()
+        _gutenbergRaw.update {
+            it.copy(
+                query = query,
+                selectedTopic = topic,
+                isLoading = true,
+                errorMessage = null
+            )
+        }
+        gutenbergJob = viewModelScope.launch {
+            val result = gutenbergRepository.fetchCatalog(query = query, topic = topic)
+            result.fold(
+                onSuccess = { page ->
+                    _gutenbergRaw.update {
+                        it.copy(
+                            books = page.results,
+                            totalCount = page.count,
+                            nextUrl = page.nextUrl,
+                            isLoading = false,
+                            errorMessage = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _gutenbergRaw.update {
+                        it.copy(
+                            isLoading = false,
+                            errorMessage = err.message ?: "Unable to reach Project Gutenberg"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun loadMoreGutenberg() {
+        val current = _gutenbergRaw.value
+        val next = current.nextUrl ?: return
+        if (current.isLoading || current.isLoadingMore) return
+        _gutenbergRaw.update { it.copy(isLoadingMore = true) }
+        viewModelScope.launch {
+            val result = gutenbergRepository.fetchCatalog(pageUrl = next)
+            result.fold(
+                onSuccess = { page ->
+                    _gutenbergRaw.update { state ->
+                        val merged = (state.books + page.results).distinctBy { it.id }
+                        state.copy(
+                            books = merged,
+                            totalCount = page.count,
+                            nextUrl = page.nextUrl,
+                            isLoadingMore = false
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _gutenbergRaw.update { it.copy(isLoadingMore = false) }
+                    _eventMessage.value = err.message ?: "Failed to load more titles"
+                }
+            )
+        }
+    }
+
+    fun downloadGutenbergBook(
+        book: GutenbergBook,
+        onReadyToOpen: ((BookEntity) -> Unit)? = null
+    ) {
+        if (book.id in _gutenbergRaw.value.downloadProgress) return
+        _gutenbergRaw.update {
+            it.copy(downloadProgress = it.downloadProgress + (book.id to 0.02f))
+        }
+        viewModelScope.launch {
+            val result = gutenbergRepository.downloadBook(
+                context = getApplication(),
+                book = book,
+                onProgress = { frac ->
+                    _gutenbergRaw.update {
+                        it.copy(downloadProgress = it.downloadProgress + (book.id to frac))
+                    }
+                }
+            )
+            result.fold(
+                onSuccess = { downloaded ->
+                    val imported = repository.importDownloadedGutenbergBook(
+                        bookFile = downloaded.bookFile,
+                        gutenbergBook = book,
+                        coverCacheFile = downloaded.coverCacheFile
+                    )
+                    _gutenbergRaw.update {
+                        it.copy(downloadProgress = it.downloadProgress - book.id)
+                    }
+                    _eventMessage.value = "Downloaded \"${imported.title}\""
+                    onReadyToOpen?.invoke(imported)
+                },
+                onFailure = { err ->
+                    _gutenbergRaw.update {
+                        it.copy(downloadProgress = it.downloadProgress - book.id)
+                    }
+                    _eventMessage.value = err.message ?: "Failed to download ${book.title}"
+                }
+            )
+        }
     }
 }

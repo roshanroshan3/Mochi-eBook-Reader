@@ -29,6 +29,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -324,16 +325,33 @@ fun MochiBookCover(
 ) {
     val palette = LocalMochiPalette.current
     val shape = RoundedCornerShape(cornerRadius)
-    val coverExists = book.coverPath != null && File(book.coverPath).exists()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val coverPath = book.coverPath
+    val coverFile = remember(coverPath) {
+        coverPath?.let { File(it) }?.takeIf { it.exists() }
+    }
 
     Box(
         modifier = modifier
             .clip(shape)
             .border(1.dp, Color(palette.textSecondary).copy(alpha = 0.16f), shape)
     ) {
-        if (coverExists) {
+        if (coverFile != null) {
+            val imageRequest = remember(coverFile, book.id) {
+                coil.request.ImageRequest.Builder(context)
+                    .data(coverFile)
+                    .memoryCacheKey("cover_${book.id}_${coverFile.lastModified()}")
+                    .size(420, 620)
+                    .precision(coil.size.Precision.INEXACT)
+                    .scale(coil.size.Scale.FILL)
+                    .allowHardware(true)
+                    .allowRgb565(true)
+                    .diskCachePolicy(coil.request.CachePolicy.DISABLED)
+                    .crossfade(160)
+                    .build()
+            }
             AsyncImage(
-                model = File(book.coverPath!!),
+                model = imageRequest,
                 contentDescription = "${book.title} cover",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()

@@ -75,33 +75,53 @@ class LibraryRepository(
         }
         themeDao.insertAll(themeEntities)
 
-        // Seed sample books if library is empty
-        if (bookDao.getAllBooksOnce().isEmpty()) {
-            seedSampleLibrary()
+        // Purge any legacy bundled sample books so the library stays clean and user-driven
+        val legacySampleIds = bookDao.getAllBooksOnce()
+            .filter { it.isSample || it.folderTreeUri == "samples://local" }
+            .map { it.id }
+        if (legacySampleIds.isNotEmpty()) {
+            bookDao.deleteBooksByIds(legacySampleIds)
+        }
+        folderDao.deleteFolder("samples://local")
+        val legacySamplesDir = File(context.filesDir, "samples")
+        if (legacySamplesDir.exists()) {
+            legacySamplesDir.deleteRecursively()
         }
     }
 
-    suspend fun seedSampleLibrary() = withContext(Dispatchers.IO) {
-        val samples = SampleBookSeeder.seedIfNeeded(context)
-        val existingByUri = bookDao.getAllBooksOnce().associateBy { it.uri }
-        val books = samples.mapIndexed { idx, sample ->
-            SafBookScanner.scanSeededSample(
-                context = context,
-                sample = sample,
-                existing = existingByUri[Uri.fromFile(sample.file).toString()],
-                shelfOrder = idx
-            )
-        }
-        books.forEach { bookDao.upsertBook(it) }
+    suspend fun importDownloadedGutenbergBook(
+        bookFile: File,
+        gutenbergBook: GutenbergBook,
+        coverCacheFile: File?
+    ): BookEntity = withContext(Dispatchers.IO) {
+        val allBooks = bookDao.getAllBooksOnce()
+        val uriStr = Uri.fromFile(bookFile).toString()
+        val existing = allBooks.firstOrNull { it.uri == uriStr }
+        val nextOrder = (allBooks.maxOfOrNull { it.shelfOrder } ?: -1) + 1
+        val scanned = SafBookScanner.scanLocalBookFile(
+            context = context,
+            file = bookFile,
+            existing = existing,
+            shelfOrder = nextOrder,
+            folderTreeUri = GUTENBERG_FOLDER_URI,
+            relativeFolderPath = gutenbergBook.languages.firstOrNull()?.uppercase() ?: "EN",
+            fallbackTitle = gutenbergBook.title,
+            fallbackAuthors = gutenbergBook.authors,
+            coverPathOverride = coverCacheFile?.takeIf { it.exists() }?.absolutePath
+        )
+        val insertedId = bookDao.upsertBook(scanned)
+        val persistedId = if (existing != null && existing.id > 0L) existing.id else insertedId
+        val gutenbergCount = bookDao.getAllBooksOnce().count { it.folderTreeUri == GUTENBERG_FOLDER_URI }
         folderDao.upsertFolder(
             FolderEntity(
-                treeUri = "samples://local",
-                displayName = "Mochi Samples",
+                treeUri = GUTENBERG_FOLDER_URI,
+                displayName = "Project Gutenberg",
                 addedAt = System.currentTimeMillis(),
                 lastScannedAt = System.currentTimeMillis(),
-                bookCount = books.size
+                bookCount = gutenbergCount
             )
         )
+        scanned.copy(id = persistedId)
     }
 
     suspend fun addSafFolder(treeUri: Uri): Int = withContext(Dispatchers.IO) {
@@ -162,7 +182,10 @@ class LibraryRepository(
 
         for (folder in allFolders) {
             if (folder.treeUri == "samples://local") {
-                seedSampleLibrary()
+                folderDao.deleteFolder("samples://local")
+            } else if (folder.treeUri == GUTENBERG_FOLDER_URI || folder.treeUri == "imported://documents") {
+                val count = bookDao.getAllBooksOnce().count { it.folderTreeUri == folder.treeUri }
+                folderDao.upsertFolder(folder.copy(lastScannedAt = System.currentTimeMillis(), bookCount = count))
             } else {
                 val treeUri = Uri.parse(folder.treeUri)
                 val scanned = SafBookScanner.scanSafTree(
@@ -326,5 +349,9 @@ class LibraryRepository(
             }
         }
         return name to size
+    }
+
+    companion object {
+        const val GUTENBERG_FOLDER_URI = "gutenberg://catalog"
     }
 }

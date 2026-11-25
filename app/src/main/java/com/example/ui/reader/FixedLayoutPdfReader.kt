@@ -2,24 +2,30 @@ package com.example.ui.reader
 
 import android.graphics.Bitmap
 import android.graphics.RectF
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -40,18 +46,19 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -74,16 +81,32 @@ import com.example.theme.MochiThemePalette
 import com.example.ui.designsystem.LocalMochiMotion
 import com.example.ui.studio.AnnotationStudioCanvasLayer
 import com.example.ui.theme.LocalMochiPalette
-import kotlinx.coroutines.launch
-import kotlin.math.absoluteValue
+import kotlinx.coroutines.delay
+import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 /**
- * High-resolution Fixed-Layout PDF Viewport (Milestone E) + GPU Page Curl & Page Turns (Milestone F):
- * - Renders via [PdfPageEngine] (LRU cached, Smart Dark Invert, Auto Margin Crop).
- * - Supports Fit-Page / Fit-Width, pinch zoom (1x-10x), smart double-tap zoom, and pan.
- * - Aligns [AnnotationStudioCanvasLayer] 1:1 with the PDF page coordinate frame.
- * - Integrates [InteractivePageCurlContainer] when zoomed to ~1x and not actively drawing in Studio.
+ * Pure pan-clamping math for zoomed PDF pages so pages never drift off-screen.
+ */
+object PdfViewportMath {
+    fun clampPan(pan: Offset, zoomScale: Float, viewportW: Float, viewportH: Float): Offset {
+        if (zoomScale <= 1.02f || viewportW <= 0f || viewportH <= 0f) return Offset.Zero
+        val maxX = ((viewportW * (zoomScale - 1f)) * 0.5f).coerceAtLeast(0f)
+        val maxY = ((viewportH * (zoomScale - 1f)) * 0.5f).coerceAtLeast(0f)
+        return Offset(
+            x = pan.x.coerceIn(-maxX, maxX),
+            y = pan.y.coerceIn(-maxY, maxY)
+        )
+    }
+}
+
+/**
+ * High-resolution Fixed-Layout PDF Viewport + Dual Spread on Tablets + Zero-Spinner Cache Rendering:
+ * - Renders via [PdfPageEngine] (instant synchronous cache hit, dedicated thumbnail cache, OOM recovery).
+ * - Matches neighbor pre-warm width bucket to the active viewport width so every turn hits RAM cache.
+ * - Cleanly separates 1-finger swipe (at 1x) from 2-finger pinch & zoomed pan without restarting gesture detector.
+ * - Uses shared [mochiPageTurnTransition] & [InteractivePageCurlContainer].
  */
 @Composable
 fun FixedLayoutPdfViewport(
@@ -104,100 +127,139 @@ fun FixedLayoutPdfViewport(
     onSelectMarkups: (Set<Long>) -> Unit,
     onMoveSelectedMarkups: (Float, Float) -> Unit,
     onCalibrateSegmentMeasured: (Float) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isDualPdfSpread: Boolean = false
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
     val motion = LocalMochiMotion.current
-    val scope = rememberCoroutineScope()
 
     val pageCount = document.pdfPageCount.coerceAtLeast(1)
     val safePage = currentPageIndex.coerceIn(0, pageCount - 1)
+    val spreadStep = if (isDualPdfSpread && !studioActive) 2 else 1
+    val spreadCount = ((pageCount + spreadStep - 1) / spreadStep).coerceAtLeast(1)
+    val currentSpread = (safePage / spreadStep).coerceIn(0, spreadCount - 1)
 
-    var zoomScale by remember(safePage) { mutableFloatStateOf(1f) }
-    var panOffset by remember(safePage) { mutableStateOf(Offset.Zero) }
+    var zoomScale by remember(safePage, isDualPdfSpread) { mutableFloatStateOf(1f) }
+    var panOffset by remember(safePage, isDualPdfSpread) { mutableStateOf(Offset.Zero) }
 
-    val pagerState = rememberPagerState(initialPage = safePage) { pageCount }
-    var lastReportedPage by remember { mutableIntStateOf(safePage) }
+    val pagerState = rememberPagerState(initialPage = currentSpread) { spreadCount }
+    var lastReportedSpread by remember { mutableIntStateOf(currentSpread) }
 
-    // Pre-warm neighbor pages in PdfPageEngine LRU cache
-    LaunchedEffect(safePage, settings.pdfSmartDarkInvert, document.bookUri) {
-        val warmWidth = 1200
-        if (safePage + 1 < pageCount) {
-            PdfPageEngine.renderPageBitmap(context, document.bookUri, safePage + 1, warmWidth, settings.pdfSmartDarkInvert)
-        }
-        if (safePage - 1 >= 0) {
-            PdfPageEngine.renderPageBitmap(context, document.bookUri, safePage - 1, warmWidth, settings.pdfSmartDarkInvert)
-        }
-    }
-
-    // Sync pager when jumping externally (scrubber / TOC / undo / thumbnails / buttons)
-    LaunchedEffect(safePage, settings.pageTurnMode) {
-        if (settings.pageTurnMode != PageTurnMode.CURL &&
-            !pagerState.isScrollInProgress &&
-            pagerState.currentPage != safePage &&
-            safePage != lastReportedPage
-        ) {
-            pagerState.scrollToPage(safePage)
-        }
-        lastReportedPage = safePage
-    }
-
-    LaunchedEffect(programmaticTurnRequest, settings.pageTurnMode) {
-        val req = programmaticTurnRequest ?: return@LaunchedEffect
-        if (settings.pageTurnMode == PageTurnMode.CURL) return@LaunchedEffect
-        val dest = req.first.coerceIn(0, pageCount - 1)
-        if (dest != pagerState.currentPage) {
-            if (motion.reduceMotion || settings.pageTurnMode == PageTurnMode.NONE) {
-                pagerState.scrollToPage(dest)
-            } else {
-                pagerState.animateScrollToPage(dest, animationSpec = motion.spatialDefault())
-            }
-        }
-    }
-
-    LaunchedEffect(pagerState.currentPage, pagerState.isScrollInProgress, settings.pageTurnMode) {
-        if (settings.pageTurnMode != PageTurnMode.CURL) {
-            onAnimationActiveChanged(pagerState.isScrollInProgress)
-            if (pagerState.currentPage != lastReportedPage) {
-                lastReportedPage = pagerState.currentPage
-                onPageChanged(pagerState.currentPage)
-            }
-        }
-    }
-
-    val useCurl = settings.pageTurnMode == PageTurnMode.CURL && zoomScale <= 1.05f && !studioActive
-
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
             .testTag("pdf_fixed_viewport")
     ) {
+        val viewportWPx = with(density) { maxWidth.toPx() }.coerceAtLeast(360f)
+        val columnTargetWidthPx = if (spreadStep == 2) {
+            (viewportWPx * 0.48f).roundToInt().coerceIn(420, 1280)
+        } else {
+            viewportWPx.roundToInt().coerceIn(480, 1408)
+        }
+
+        // Pre-warm neighbor pages using EXACT same width bucket so page turns render on frame 0
+        LaunchedEffect(safePage, spreadStep, columnTargetWidthPx, settings.pdfSmartDarkInvert, document.bookUri) {
+            val pagesToWarm = buildList {
+                for (delta in 1..2) {
+                    val f = safePage + delta * spreadStep
+                    if (f < pageCount) add(f)
+                    if (spreadStep == 2 && f + 1 < pageCount) add(f + 1)
+                }
+                val prev = safePage - spreadStep
+                if (prev >= 0) {
+                    add(prev)
+                    if (spreadStep == 2 && prev + 1 < pageCount) add(prev + 1)
+                }
+            }
+            pagesToWarm.forEach { idx ->
+                PdfPageEngine.renderPageBitmap(
+                    context = context,
+                    uriString = document.bookUri,
+                    pageIndex = idx,
+                    targetWidthPx = columnTargetWidthPx,
+                    smartDarkInvert = settings.pdfSmartDarkInvert
+                )
+            }
+        }
+
+        // Sync pager when jumping externally (scrubber / TOC / undo / thumbnails / buttons)
+        LaunchedEffect(currentSpread, settings.pageTurnMode, spreadStep) {
+            if (settings.pageTurnMode != PageTurnMode.CURL &&
+                !pagerState.isScrollInProgress &&
+                pagerState.currentPage != currentSpread &&
+                currentSpread != lastReportedSpread
+            ) {
+                pagerState.scrollToPage(currentSpread)
+            }
+            lastReportedSpread = currentSpread
+        }
+
+        LaunchedEffect(programmaticTurnRequest, settings.pageTurnMode, spreadStep) {
+            val req = programmaticTurnRequest ?: return@LaunchedEffect
+            if (settings.pageTurnMode == PageTurnMode.CURL) return@LaunchedEffect
+            val destSpread = (req.first.coerceIn(0, pageCount - 1) / spreadStep).coerceIn(0, spreadCount - 1)
+            if (destSpread != pagerState.currentPage) {
+                if (motion.reduceMotion || settings.pageTurnMode == PageTurnMode.NONE) {
+                    pagerState.scrollToPage(destSpread)
+                } else {
+                    pagerState.animateScrollToPage(destSpread, animationSpec = motion.spatialDefault())
+                }
+            }
+        }
+
+        LaunchedEffect(pagerState.currentPage, pagerState.isScrollInProgress, settings.pageTurnMode, spreadStep) {
+            if (settings.pageTurnMode != PageTurnMode.CURL) {
+                onAnimationActiveChanged(pagerState.isScrollInProgress)
+                if (pagerState.currentPage != lastReportedSpread) {
+                    lastReportedSpread = pagerState.currentPage
+                    val destPage = (pagerState.currentPage * spreadStep).coerceIn(0, pageCount - 1)
+                    onPageChanged(destPage)
+                }
+            }
+        }
+
+        val useCurl = settings.pageTurnMode == PageTurnMode.CURL && zoomScale <= 1.05f && !studioActive
+        val markupsByPage = remember(studioMarkups) { studioMarkups.groupBy { it.pageIndex } }
+        val scalesByPage = remember(studioScales) { studioScales.associateBy { it.pageIndex } }
+        val pageBgColor = if (settings.pdfSmartDarkInvert) Color(0xFF1A1C20) else Color(palette.paperTint)
+
+        val mappedTurnRequest = remember(programmaticTurnRequest, spreadStep) {
+            programmaticTurnRequest?.let { (pageIdx, ts) ->
+                (pageIdx.coerceIn(0, pageCount - 1) / spreadStep) to ts
+            }
+        }
+
         if (useCurl) {
             InteractivePageCurlContainer(
-                currentPageIndex = safePage,
-                pageCount = pageCount,
-                paperTintColor = Color(palette.paperTint),
+                currentPageIndex = currentSpread,
+                pageCount = spreadCount,
+                paperTintColor = pageBgColor,
                 curlStrength = settings.curlStrength,
                 curlShadowStrength = settings.curlShadowStrength,
                 curlShowPageBack = settings.curlShowPageBack,
                 curlSpeed = settings.curlSpeed,
                 grabMode = settings.curlGrabMode,
                 reduceMotion = motion.reduceMotion,
-                onTurnToPage = onPageChanged,
+                onTurnToPage = { destSpread ->
+                    onPageChanged((destSpread * spreadStep).coerceIn(0, pageCount - 1))
+                },
                 onAnimationActiveChanged = onAnimationActiveChanged,
                 onCenterTap = onCenterTap,
-                programmaticTurnRequest = programmaticTurnRequest
-            ) { pageIdx ->
-                PdfSinglePageSurface(
+                programmaticTurnRequest = mappedTurnRequest
+            ) { spreadIdx ->
+                PdfSpreadContent(
                     document = document,
-                    pageIndex = pageIdx,
+                    spreadIdx = spreadIdx,
+                    spreadStep = spreadStep,
+                    pageCount = pageCount,
+                    pageBgColor = pageBgColor,
                     settings = settings,
                     palette = palette,
                     studioActive = false,
                     studioLayers = studioLayers,
-                    pageMarkups = studioMarkups.filter { it.pageIndex == pageIdx },
-                    pageScale = studioScales.firstOrNull { it.pageIndex == pageIdx },
+                    markupsByPage = markupsByPage,
+                    scalesByPage = scalesByPage,
                     studioSession = studioSession,
                     zoomScale = 1f,
                     panOffset = Offset.Zero,
@@ -205,7 +267,8 @@ fun FixedLayoutPdfViewport(
                         zoomScale = newZoom
                         panOffset = newPan
                     },
-                    onCreateMarkupDraft = { tool, geo -> onCreateMarkupDraft(pageIdx, tool, geo) },
+                    onCenterTap = null,
+                    onCreateMarkupDraft = onCreateMarkupDraft,
                     onSelectMarkups = onSelectMarkups,
                     onMoveSelectedMarkups = onMoveSelectedMarkups,
                     onCalibrateSegmentMeasured = onCalibrateSegmentMeasured
@@ -215,68 +278,146 @@ fun FixedLayoutPdfViewport(
             HorizontalPager(
                 state = pagerState,
                 beyondViewportPageCount = 1,
+                key = { it },
                 userScrollEnabled = !studioActive && zoomScale <= 1.05f,
                 modifier = Modifier.fillMaxSize()
-            ) { pageIdx ->
-                val offsetFraction = (pagerState.currentPage - pageIdx) + pagerState.currentPageOffsetFraction
-                val transformModifier = when (settings.pageTurnMode) {
-                    PageTurnMode.SLIDE -> Modifier
-                    PageTurnMode.COVER_FLIP -> Modifier.graphicsLayer {
-                        if (!motion.reduceMotion) {
-                            translationX = offsetFraction * size.width * 0.42f
-                            rotationY = (offsetFraction * -34f).coerceIn(-45f, 45f)
-                            cameraDistance = 16f * density.density
-                            transformOrigin = TransformOrigin(if (offsetFraction >= 0f) 0f else 1f, 0.5f)
-                            alpha = (1f - offsetFraction.absoluteValue * 0.35f).coerceIn(0f, 1f)
-                        }
-                    }
-                    PageTurnMode.STACK -> Modifier.graphicsLayer {
-                        if (!motion.reduceMotion) {
-                            val absOff = offsetFraction.absoluteValue
-                            if (offsetFraction < 0f) {
-                                // Underneath incoming/previous sheet: stays stacked & grows from 0.91 -> 1.0
-                                translationX = offsetFraction * size.width
-                                val s = (1f - absOff * 0.09f).coerceAtLeast(0.88f)
-                                scaleX = s
-                                scaleY = s
-                                alpha = (1f - absOff * 0.30f).coerceIn(0.2f, 1f)
-                            } else {
-                                alpha = (1f - absOff * 0.15f).coerceIn(0.4f, 1f)
-                            }
-                        }
-                    }
-                    PageTurnMode.FADE -> Modifier.graphicsLayer {
-                        translationX = offsetFraction * size.width * 0.94f
-                        alpha = (1f - offsetFraction.absoluteValue * 1.1f).coerceIn(0f, 1f)
-                    }
-                    PageTurnMode.CURL, PageTurnMode.NONE, PageTurnMode.SCROLL -> Modifier
-                }
-
-                PdfSinglePageSurface(
+            ) { spreadIdx ->
+                val offsetFraction = (pagerState.currentPage - spreadIdx) + pagerState.currentPageOffsetFraction
+                PdfSpreadContent(
                     document = document,
-                    pageIndex = pageIdx,
+                    spreadIdx = spreadIdx,
+                    spreadStep = spreadStep,
+                    pageCount = pageCount,
+                    pageBgColor = pageBgColor,
                     settings = settings,
                     palette = palette,
-                    studioActive = studioActive && pageIdx == pagerState.currentPage,
+                    studioActive = studioActive && spreadIdx == pagerState.currentPage,
                     studioLayers = studioLayers,
-                    pageMarkups = studioMarkups.filter { it.pageIndex == pageIdx },
-                    pageScale = studioScales.firstOrNull { it.pageIndex == pageIdx },
+                    markupsByPage = markupsByPage,
+                    scalesByPage = scalesByPage,
                     studioSession = studioSession,
-                    zoomScale = if (pageIdx == pagerState.currentPage) zoomScale else 1f,
-                    panOffset = if (pageIdx == pagerState.currentPage) panOffset else Offset.Zero,
+                    zoomScale = if (spreadIdx == pagerState.currentPage) zoomScale else 1f,
+                    panOffset = if (spreadIdx == pagerState.currentPage) panOffset else Offset.Zero,
                     onTransformChange = { z, p ->
-                        if (pageIdx == pagerState.currentPage) {
+                        if (spreadIdx == pagerState.currentPage) {
                             zoomScale = z
                             panOffset = p
                         }
                     },
                     onCenterTap = if (!studioActive && zoomScale <= 1.05f) onCenterTap else null,
-                    onCreateMarkupDraft = { tool, geo -> onCreateMarkupDraft(pageIdx, tool, geo) },
+                    onCreateMarkupDraft = onCreateMarkupDraft,
                     onSelectMarkups = onSelectMarkups,
                     onMoveSelectedMarkups = onMoveSelectedMarkups,
                     onCalibrateSegmentMeasured = onCalibrateSegmentMeasured,
-                    modifier = Modifier.then(transformModifier)
+                    modifier = Modifier.mochiPageTurnTransition(
+                        mode = settings.pageTurnMode,
+                        offsetFraction = offsetFraction,
+                        reduceMotion = motion.reduceMotion
+                    )
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PdfSpreadContent(
+    document: ParsedDocument,
+    spreadIdx: Int,
+    spreadStep: Int,
+    pageCount: Int,
+    pageBgColor: Color,
+    settings: ReaderSettings,
+    palette: MochiThemePalette,
+    studioActive: Boolean,
+    studioLayers: List<AnnotationLayerEntity>,
+    markupsByPage: Map<Int, List<MarkupObjectEntity>>,
+    scalesByPage: Map<Int, PageScaleEntity>,
+    studioSession: StudioSessionState,
+    zoomScale: Float,
+    panOffset: Offset,
+    onTransformChange: (Float, Offset) -> Unit,
+    onCenterTap: ((Float) -> Unit)?,
+    onCreateMarkupDraft: (Int, StudioTool, StudioGeometryJson) -> Unit,
+    onSelectMarkups: (Set<Long>) -> Unit,
+    onMoveSelectedMarkups: (Float, Float) -> Unit,
+    onCalibrateSegmentMeasured: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val leftPageIdx = spreadIdx * spreadStep
+    val rightPageIdx = if (spreadStep == 2 && leftPageIdx + 1 < pageCount) leftPageIdx + 1 else null
+
+    Row(
+        modifier = modifier
+            .fillMaxSize()
+            .background(pageBgColor)
+    ) {
+        if (leftPageIdx < pageCount) {
+            PdfSinglePageSurface(
+                document = document,
+                pageIndex = leftPageIdx,
+                settings = settings,
+                palette = palette,
+                studioActive = studioActive,
+                studioLayers = studioLayers,
+                pageMarkups = markupsByPage[leftPageIdx].orEmpty(),
+                pageScale = scalesByPage[leftPageIdx],
+                studioSession = studioSession,
+                zoomScale = zoomScale,
+                panOffset = panOffset,
+                onTransformChange = onTransformChange,
+                onCenterTap = onCenterTap,
+                onCreateMarkupDraft = { tool, geo -> onCreateMarkupDraft(leftPageIdx, tool, geo) },
+                onSelectMarkups = onSelectMarkups,
+                onMoveSelectedMarkups = onMoveSelectedMarkups,
+                onCalibrateSegmentMeasured = onCalibrateSegmentMeasured,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+        }
+        if (spreadStep == 2) {
+            Box(
+                modifier = Modifier
+                    .width(12.dp)
+                    .fillMaxHeight()
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(
+                                Color.Transparent,
+                                Color.Black.copy(alpha = if (palette.isDark) 0.30f else 0.09f),
+                                Color.Transparent
+                            )
+                        )
+                    )
+            )
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            ) {
+                if (rightPageIdx != null) {
+                    PdfSinglePageSurface(
+                        document = document,
+                        pageIndex = rightPageIdx,
+                        settings = settings,
+                        palette = palette,
+                        studioActive = false,
+                        studioLayers = studioLayers,
+                        pageMarkups = markupsByPage[rightPageIdx].orEmpty(),
+                        pageScale = scalesByPage[rightPageIdx],
+                        studioSession = studioSession,
+                        zoomScale = zoomScale,
+                        panOffset = panOffset,
+                        onTransformChange = onTransformChange,
+                        onCenterTap = onCenterTap,
+                        onCreateMarkupDraft = { tool, geo -> onCreateMarkupDraft(rightPageIdx, tool, geo) },
+                        onSelectMarkups = onSelectMarkups,
+                        onMoveSelectedMarkups = onMoveSelectedMarkups,
+                        onCalibrateSegmentMeasured = onCalibrateSegmentMeasured,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
             }
         }
     }
@@ -318,11 +459,28 @@ private fun PdfSinglePageSurface(
         val maxWPx = with(density) { maxWidth.toPx() }.coerceAtLeast(300f)
         val maxHPx = with(density) { maxHeight.toPx() }.coerceAtLeast(300f)
 
-        // Increase raster resolution dynamically up to 2.5x when zooming in
-        val desiredRenderPx = (maxWPx * zoomScale.coerceIn(1f, 2.5f)).roundToInt().coerceIn(480, 2600)
-        var bitmap by remember(document.bookUri, pageIndex, settings.pdfSmartDarkInvert) { mutableStateOf<Bitmap?>(null) }
+        // At 1x zoom keep resolution crisp & memory-light (<=1408px); bump cleanly when zoomed >1.3x
+        val effectiveZoomTier = if (zoomScale <= 1.3f) 1f else zoomScale.coerceIn(1.3f, 2.2f)
+        val desiredRenderPx = (maxWPx * effectiveZoomTier).roundToInt().coerceIn(480, 2200)
+
+        var bitmap by remember(document.bookUri, pageIndex, settings.pdfSmartDarkInvert) {
+            mutableStateOf(
+                PdfPageEngine.getCachedBitmap(
+                    uriString = document.bookUri,
+                    pageIndex = pageIndex,
+                    targetWidthPx = desiredRenderPx,
+                    smartDarkInvert = settings.pdfSmartDarkInvert
+                )
+            )
+        }
         var cropRect by remember(document.bookUri, pageIndex, settings.pdfAutoMarginCrop) {
-            mutableStateOf(RectF(0f, 0f, 1f, 1f))
+            mutableStateOf(
+                if (settings.pdfAutoMarginCrop) {
+                    PdfPageEngine.getCachedCropBounds(document.bookUri, pageIndex) ?: RectF(0f, 0f, 1f, 1f)
+                } else {
+                    RectF(0f, 0f, 1f, 1f)
+                }
+            )
         }
 
         LaunchedEffect(document.bookUri, pageIndex, desiredRenderPx, settings.pdfSmartDarkInvert, settings.pdfAutoMarginCrop) {
@@ -333,11 +491,13 @@ private fun PdfSinglePageSurface(
                 targetWidthPx = desiredRenderPx,
                 smartDarkInvert = settings.pdfSmartDarkInvert
             )
-            bitmap = bmp
-            if (bmp != null && settings.pdfAutoMarginCrop) {
-                cropRect = PdfPageEngine.detectNormalizedContentBounds(bmp)
-            } else {
-                cropRect = RectF(0f, 0f, 1f, 1f)
+            if (bmp != null) {
+                bitmap = bmp
+                if (settings.pdfAutoMarginCrop) {
+                    cropRect = PdfPageEngine.getOrComputeContentBounds(document.bookUri, pageIndex, bmp)
+                } else {
+                    cropRect = RectF(0f, 0f, 1f, 1f)
+                }
             }
         }
 
@@ -345,7 +505,6 @@ private fun PdfSinglePageSurface(
         val effectiveCropH = (cropRect.height()).coerceIn(0.3f, 1f)
         val effectiveAspect = (pageWidthPts * effectiveCropW) / (pageHeightPts * effectiveCropH)
 
-        // Compute displayed page dimensions cleanly
         val (pageBoxW, pageBoxH) = if (settings.pdfFitMode == PdfFitMode.FIT_WIDTH) {
             maxWidth to (maxWidth / effectiveAspect)
         } else {
@@ -358,45 +517,109 @@ private fun PdfSinglePageSurface(
         }
 
         val bmp = bitmap
-        if (bmp == null) {
+        if (bmp == null || bmp.isRecycled) {
             Box(
                 modifier = Modifier
                     .size(pageBoxW, pageBoxH)
-                    .background(Color(palette.surfaceVariant).copy(alpha = 0.4f), RoundedCornerShape(12.dp)),
+                    .background(Color(palette.surfaceVariant).copy(alpha = 0.35f), RoundedCornerShape(10.dp)),
                 contentAlignment = Alignment.Center
             ) {
-                CircularProgressIndicator(color = Color(palette.accent), modifier = Modifier.size(32.dp))
+                CircularProgressIndicator(color = Color(palette.accent), modifier = Modifier.size(30.dp))
             }
         } else {
+            val zoomState = rememberUpdatedState(zoomScale)
+            val panState = rememberUpdatedState(panOffset)
+            val onTransformState = rememberUpdatedState(onTransformChange)
+            val onCenterTapState = rememberUpdatedState(onCenterTap)
+
+            // Keyed ONLY on pageIndex & studioActive so pinch/pan NEVER restarts mid-gesture
             val gestureModifier = if (!studioActive) {
-                Modifier
-                    .pointerInput(pageIndex, zoomScale, panOffset) {
-                        detectTransformGestures { _, pan, zoom, _ ->
-                            val nextZ = (zoomScale * zoom).coerceIn(1f, 10f)
-                            val nextPan = if (nextZ <= 1.03f) Offset.Zero else panOffset + pan
-                            onTransformChange(nextZ, nextPan)
-                        }
-                    }
-                    .pointerInput(pageIndex, zoomScale, cropRect) {
-                        detectTapGestures(
-                            onDoubleTap = { tap ->
-                                if (zoomScale > 1.25f) {
-                                    onTransformChange(1f, Offset.Zero)
-                                } else {
-                                    val targetZoom = 2.35f
-                                    val dx = (size.width * 0.5f - tap.x) * (targetZoom - 1f)
-                                    val dy = (size.height * 0.5f - tap.y) * (targetZoom - 1f)
-                                    onTransformChange(targetZoom, Offset(dx, dy))
+                Modifier.pointerInput(pageIndex, studioActive) {
+                    var lastTapTimeMs = 0L
+                    var lastTapPos = Offset.Zero
+
+                    awaitEachGesture {
+                        val firstDown = awaitFirstDown(requireUnconsumed = false)
+                        val downPos = firstDown.position
+                        var movedDist = 0f
+                        var isTransforming = false
+
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pressedChanges = event.changes.filter { it.pressed }
+                            if (pressedChanges.isEmpty()) {
+                                if (!isTransforming && movedDist < viewConfiguration.touchSlop) {
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastTapTimeMs <= viewConfiguration.doubleTapTimeoutMillis &&
+                                        (downPos - lastTapPos).getDistance() < viewConfiguration.touchSlop * 3f
+                                    ) {
+                                        lastTapTimeMs = 0L
+                                        val curZoom = zoomState.value
+                                        if (curZoom > 1.25f) {
+                                            onTransformState.value(1f, Offset.Zero)
+                                        } else {
+                                            val targetZoom = 2.35f
+                                            val rawPan = Offset(
+                                                (size.width * 0.5f - downPos.x) * (targetZoom - 1f),
+                                                (size.height * 0.5f - downPos.y) * (targetZoom - 1f)
+                                            )
+                                            val clamped = PdfViewportMath.clampPan(
+                                                rawPan, targetZoom, size.width.toFloat(), size.height.toFloat()
+                                            )
+                                            onTransformState.value(targetZoom, clamped)
+                                        }
+                                    } else {
+                                        lastTapTimeMs = now
+                                        lastTapPos = downPos
+                                        if (zoomState.value <= 1.05f) {
+                                            onCenterTapState.value?.invoke(downPos.x)
+                                        }
+                                    }
                                 }
-                            },
-                            onTap = { tap ->
-                                if (zoomScale <= 1.05f) {
-                                    onCenterTap?.invoke(tap.x)
+                                break
+                            }
+
+                            val multiTouch = pressedChanges.size >= 2
+                            val curZoom = zoomState.value
+
+                            if (multiTouch) {
+                                val zoomChange = event.calculateZoom()
+                                val panChange = event.calculatePan()
+                                if (abs(zoomChange - 1f) > 0.002f || panChange != Offset.Zero) {
+                                    isTransforming = true
+                                    val nextZ = (curZoom * zoomChange).coerceIn(1f, 8f)
+                                    val nextPan = PdfViewportMath.clampPan(
+                                        panState.value + panChange,
+                                        nextZ,
+                                        size.width.toFloat(),
+                                        size.height.toFloat()
+                                    )
+                                    onTransformState.value(nextZ, nextPan)
+                                    pressedChanges.forEach { it.consume() }
+                                }
+                            } else {
+                                val change = pressedChanges.first()
+                                val delta = change.positionChange()
+                                movedDist += hypot(delta.x, delta.y)
+                                // Only consume 1-finger pan when actually zoomed in! At 1x, leave swipe for HorizontalPager/PageCurl.
+                                if (curZoom > 1.05f && movedDist > viewConfiguration.touchSlop) {
+                                    isTransforming = true
+                                    val nextPan = PdfViewportMath.clampPan(
+                                        panState.value + delta,
+                                        curZoom,
+                                        size.width.toFloat(),
+                                        size.height.toFloat()
+                                    )
+                                    onTransformState.value(curZoom, nextPan)
+                                    change.consume()
                                 }
                             }
-                        )
+                        }
                     }
+                }
             } else Modifier
+
+            val imageBitmap = remember(bmp) { bmp.asImageBitmap() }
 
             Box(
                 modifier = Modifier
@@ -412,24 +635,21 @@ private fun PdfSinglePageSurface(
                     .clip(RoundedCornerShape(6.dp))
                     .background(if (settings.pdfSmartDarkInvert) Color(0xFF1D1F24) else Color.White)
             ) {
-                val croppedBitmap = remember(bmp, cropRect, settings.pdfAutoMarginCrop) {
-                    if (!settings.pdfAutoMarginCrop || (cropRect.left <= 0.01f && cropRect.right >= 0.99f)) {
-                        bmp.asImageBitmap()
-                    } else {
-                        val sx = (cropRect.left * bmp.width).roundToInt().coerceIn(0, bmp.width - 2)
-                        val sy = (cropRect.top * bmp.height).roundToInt().coerceIn(0, bmp.height - 2)
-                        val sw = (cropRect.width() * bmp.width).roundToInt().coerceIn(2, bmp.width - sx)
-                        val sh = (cropRect.height() * bmp.height).roundToInt().coerceIn(2, bmp.height - sy)
-                        Bitmap.createBitmap(bmp, sx, sy, sw, sh).asImageBitmap()
-                    }
+                // Zero-copy Canvas crop draw instead of Bitmap.createBitmap on UI thread!
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val useCrop = settings.pdfAutoMarginCrop && (cropRect.left > 0.01f || cropRect.right < 0.99f)
+                    val sx = if (useCrop) (cropRect.left * imageBitmap.width).roundToInt().coerceIn(0, imageBitmap.width - 2) else 0
+                    val sy = if (useCrop) (cropRect.top * imageBitmap.height).roundToInt().coerceIn(0, imageBitmap.height - 2) else 0
+                    val sw = if (useCrop) (cropRect.width() * imageBitmap.width).roundToInt().coerceIn(2, imageBitmap.width - sx) else imageBitmap.width
+                    val sh = if (useCrop) (cropRect.height() * imageBitmap.height).roundToInt().coerceIn(2, imageBitmap.height - sy) else imageBitmap.height
+                    drawImage(
+                        image = imageBitmap,
+                        srcOffset = IntOffset(sx, sy),
+                        srcSize = IntSize(sw, sh),
+                        dstOffset = IntOffset.Zero,
+                        dstSize = IntSize(size.width.roundToInt().coerceAtLeast(1), size.height.roundToInt().coerceAtLeast(1))
+                    )
                 }
-
-                Image(
-                    bitmap = croppedBitmap,
-                    contentDescription = "PDF Page ${pageIndex + 1}",
-                    contentScale = ContentScale.FillBounds,
-                    modifier = Modifier.fillMaxSize()
-                )
 
                 // CAD Studio vector overlay sits directly over PDF page inside zoom/pan transform
                 AnnotationStudioCanvasLayer(
@@ -494,15 +714,19 @@ fun PdfThumbnailsSheet(
                 modifier = Modifier.height(420.dp)
             ) {
                 items(pageNumbers, key = { it }) { idx ->
-                    var thumb by remember(bookUri, idx, smartDarkInvert) { mutableStateOf<Bitmap?>(null) }
+                    var thumb by remember(bookUri, idx, smartDarkInvert) {
+                        mutableStateOf(PdfPageEngine.getCachedThumbnail(bookUri, idx, smartDarkInvert))
+                    }
                     LaunchedEffect(bookUri, idx, smartDarkInvert) {
-                        thumb = PdfPageEngine.renderPageBitmap(
-                            context = context,
-                            uriString = bookUri,
-                            pageIndex = idx,
-                            targetWidthPx = 300,
-                            smartDarkInvert = smartDarkInvert
-                        )
+                        if (thumb == null) {
+                            delay((idx % 4) * 18L)
+                            thumb = PdfPageEngine.renderThumbnailBitmap(
+                                context = context,
+                                uriString = bookUri,
+                                pageIndex = idx,
+                                smartDarkInvert = smartDarkInvert
+                            )
+                        }
                     }
                     val selected = idx == currentPageIndex
                     Surface(
@@ -530,11 +754,11 @@ fun PdfThumbnailsSheet(
                                     .fillMaxWidth()
                                     .aspectRatio(0.76f)
                                     .clip(RoundedCornerShape(8.dp))
-                                    .background(Color.White),
+                                    .background(if (smartDarkInvert) Color(0xFF1D1F24) else Color.White),
                                 contentAlignment = Alignment.Center
                             ) {
                                 val t = thumb
-                                if (t != null) {
+                                if (t != null && !t.isRecycled) {
                                     Image(
                                         bitmap = t.asImageBitmap(),
                                         contentDescription = "Thumbnail page ${idx + 1}",

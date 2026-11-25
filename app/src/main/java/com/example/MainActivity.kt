@@ -3,6 +3,7 @@ package com.example
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -60,6 +61,7 @@ import com.example.ui.designsystem.MochiWidthClass
 import com.example.ui.dictionary.DictionaryManagerSheet
 import com.example.ui.dictionary.DictionaryViewModel
 import com.example.ui.library.BookDetailSheet
+import com.example.ui.library.GutenbergCatalogSheet
 import com.example.ui.library.LibraryScreen
 import com.example.ui.library.LibraryViewModel
 import com.example.ui.notes.NotesScreen
@@ -102,6 +104,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+        )
         enableEdgeToEdge()
         pendingIncomingUri = extractIncomingUri(intent)
         setContent {
@@ -141,6 +147,7 @@ fun MochiAppRoot(
     val context = LocalContext.current
     val appState by appViewModel.uiState.collectAsStateWithLifecycle()
     val libraryState by libraryViewModel.uiState.collectAsStateWithLifecycle()
+    val gutenbergState by libraryViewModel.gutenbergState.collectAsStateWithLifecycle()
     val systemDark = isSystemInDarkTheme()
     val activePalette = appViewModel.resolveActivePalette(appState, systemDark)
 
@@ -150,6 +157,7 @@ fun MochiAppRoot(
     var bookForInfoSheet by remember { mutableStateOf<BookEntity?>(null) }
     var pendingOpenedBookId by remember { mutableStateOf<Long?>(null) }
     var showReadingStatsSheet by remember { mutableStateOf(false) }
+    var showGutenbergSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(incomingUri) {
         if (incomingUri != null) {
@@ -364,7 +372,11 @@ fun MochiAppRoot(
                                             onAddTag = libraryViewModel::addTagToBook,
                                             onRemoveTag = libraryViewModel::removeTagFromBook,
                                             onBottomBarVisibilityChange = { visible -> libraryBottomBarVisible = visible },
-                                            onOpenStats = { showReadingStatsSheet = true }
+                                            onOpenStats = { showReadingStatsSheet = true },
+                                            onOpenGutenbergCatalog = {
+                                                libraryViewModel.openGutenbergCatalogIfNeeded()
+                                                showGutenbergSheet = true
+                                            }
                                         )
                                     }
                                 }
@@ -569,6 +581,7 @@ fun MochiAppRoot(
                                                 onOpenBookInfo = { bookForInfoSheet = it },
                                                 onToggleChrome = readerViewModel::toggleChrome,
                                                 onUpdatePage = readerViewModel::updateCurrentPage,
+                                                onUpdateLocator = readerViewModel::updateLocator,
                                                 onUpdateScrollProgression = readerViewModel::updateScrollProgression,
                                                 onJumpWithUndo = readerViewModel::jumpWithUndo,
                                                 onUndoJump = readerViewModel::undoJump,
@@ -701,6 +714,22 @@ fun MochiAppRoot(
                     ReadingStatsSheet(
                         insights = libraryState.readingInsights,
                         onDismiss = { showReadingStatsSheet = false }
+                    )
+                }
+
+                if (showGutenbergSheet) {
+                    GutenbergCatalogSheet(
+                        state = gutenbergState,
+                        onDismiss = { showGutenbergSheet = false },
+                        onQueryChange = libraryViewModel::setGutenbergQuery,
+                        onSearch = { q, t -> libraryViewModel.searchGutenberg(q, t) },
+                        onSelectTopic = { t -> libraryViewModel.searchGutenberg(gutenbergState.query, t) },
+                        onDownloadBook = { book -> libraryViewModel.downloadGutenbergBook(book) },
+                        onOpenDownloadedBook = { bookId ->
+                            showGutenbergSheet = false
+                            navController.navigate(MochiRoutes.readerRoute(bookId))
+                        },
+                        onLoadMore = libraryViewModel::loadMoreGutenberg
                     )
                 }
             }

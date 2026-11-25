@@ -2,7 +2,6 @@ package com.example.ui.reader
 
 import android.app.Activity
 import android.content.pm.ActivityInfo
-import android.graphics.BitmapFactory
 import android.view.WindowManager
 import android.content.Intent
 import androidx.activity.compose.BackHandler
@@ -56,15 +55,24 @@ import androidx.compose.material.icons.rounded.Article
 import androidx.compose.material.icons.rounded.BrightnessMedium
 import androidx.compose.material.icons.rounded.CheckBox
 import androidx.compose.material.icons.rounded.CheckBoxOutlineBlank
+import androidx.compose.material.icons.rounded.Contrast
+import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.Draw
+import androidx.compose.material.icons.rounded.FitScreen
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.LightMode
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.rounded.ViewColumn
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -80,6 +88,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -91,7 +100,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -125,9 +133,12 @@ import com.example.data.preferences.ReaderAction
 import com.example.data.preferences.ReaderGesture
 import com.example.data.preferences.ReaderSettings
 import com.example.data.reader.ContentBlock
+import com.example.data.reader.LazyBookPager
+import com.example.data.reader.LazyBookSnapshot
 import com.example.data.reader.PageSlice
 import com.example.data.reader.PaginatedBook
 import com.example.data.reader.ParsedDocument
+import com.example.data.reader.ReaderDocumentCache
 import com.example.data.reader.ReaderFontResolver
 import com.example.data.reader.ReaderLocator
 import com.example.data.reader.ReaderPage
@@ -144,13 +155,11 @@ import com.example.ui.theme.LocalMochiPalette
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.math.absoluteValue
 import kotlin.math.roundToInt
 
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.BookmarkBorder
 import androidx.compose.material.icons.rounded.Bookmarks
@@ -219,6 +228,7 @@ fun ReaderScreen(
     onOpenBookInfo: (BookEntity) -> Unit,
     onToggleChrome: (Boolean?) -> Unit,
     onUpdatePage: (Int, PaginatedBook) -> Unit,
+    onUpdateLocator: ((ReaderLocator) -> Unit)? = null,
     onUpdateScrollProgression: (Int, Float, String) -> Unit,
     onJumpWithUndo: (ReaderLocator) -> Unit,
     onUndoJump: () -> ReaderLocator?,
@@ -352,6 +362,7 @@ fun ReaderScreen(
     var isPageAnimating by remember { mutableStateOf(false) }
     var programmaticTurnRequest by remember { mutableStateOf<Pair<Int, Long>?>(null) }
     var showPdfThumbnails by remember { mutableStateOf(false) }
+    var showOverflowMenu by remember { mutableStateOf(false) }
     var showStudioInspector by remember { mutableStateOf(false) }
     var showStudioLayers by remember { mutableStateOf(false) }
     var showStudioExport by remember { mutableStateOf(false) }
@@ -387,7 +398,7 @@ fun ReaderScreen(
         if (state.chromeVisible && !state.studioActive && !showAaSheet && !showToc && !showAnnotationsPanel &&
             !showSearchSheet && !showCommandPalette && !showBookmarkDialog &&
             !showExportSheet && !showDictLookupPopup && !showDictManagerSheet &&
-            !showPdfThumbnails && !showStudioInspector && !showStudioLayers && !showStudioExport &&
+            !showPdfThumbnails && !showOverflowMenu && !showStudioInspector && !showStudioLayers && !showStudioExport &&
             activeSelectionDraft == null
         ) {
             delay(4500)
@@ -442,6 +453,10 @@ fun ReaderScreen(
         val book = state.book
         val isPdfDoc = rawDocument.isFixedLayoutPdf
         val isPdfReflowActive = isPdfDoc && settings.pdfReflowEnabled
+        val isDualPdfSpread = isPdfDoc && !isPdfReflowActive &&
+            widthClass == MochiWidthClass.EXPANDED &&
+            settings.pageSpreadMode == PageSpreadMode.DUAL &&
+            !state.studioActive
 
         LaunchedEffect(isPdfDoc, settings.pdfReflowEnabled, rawDocument.bookUri) {
             if (isPdfDoc && settings.pdfReflowEnabled) {
@@ -512,7 +527,7 @@ fun ReaderScreen(
             }
         }
 
-        val textMeasurer = rememberTextMeasurer()
+        val textMeasurer = rememberTextMeasurer(cacheSize = 48)
         val density = LocalDensity.current
 
         val horizontalPaddingDp = settings.marginHorizontalDp.dp
@@ -525,7 +540,30 @@ fun ReaderScreen(
         val pdfPageCount = document.pdfPageCount.coerceAtLeast(1)
         val pdfPageIdx = state.currentLocator.chapterIndex.coerceIn(0, pdfPageCount - 1)
 
-        val paginated = remember(
+        val fixedPdfSnapshot = remember(isFixedPdf, pdfPageCount) {
+            if (!isFixedPdf) null
+            else LazyBookSnapshot(
+                chunks = emptyList(),
+                chunkStartPages = intArrayOf(0, pdfPageCount),
+                chapterStartPages = (0 until pdfPageCount).associateWith { it },
+                chapterEndPages = (0 until pdfPageCount).associateWith { it },
+                totalPages = pdfPageCount,
+                version = 1,
+                isReady = true,
+                pageLookup = { idx ->
+                    ReaderPage(
+                        pageIndex = idx,
+                        chapterIndex = idx,
+                        chapterTitle = "Page ${idx + 1}",
+                        startCharOffset = 0,
+                        endCharOffset = 0,
+                        slices = emptyList()
+                    )
+                }
+            )
+        }
+
+        val lazyPager = remember(
             document,
             isFixedPdf,
             settings.fontId,
@@ -541,45 +579,70 @@ fun ReaderScreen(
             pageWidthPx,
             pageHeightPx
         ) {
-            if (isFixedPdf) {
-                PaginatedBook(
-                    pages = List(pdfPageCount) { idx ->
-                        ReaderPage(
-                            pageIndex = idx,
-                            chapterIndex = idx,
-                            chapterTitle = "Page ${idx + 1}",
-                            startCharOffset = 0,
-                            endCharOffset = 0,
-                            slices = emptyList()
-                        )
-                    },
-                    chapterStartPages = (0 until pdfPageCount).associateWith { it }
-                )
+            if (isFixedPdf) null
+            else LazyBookPager(
+                document = document,
+                settings = settings,
+                palette = palette,
+                textMeasurer = textMeasurer,
+                density = density,
+                pageWidthPx = pageWidthPx,
+                pageHeightPx = pageHeightPx
+            )
+        }
+
+        DisposableEffect(lazyPager) {
+            onDispose {
+                lazyPager?.clear()
+            }
+        }
+
+        var reflowSnapshot by remember(lazyPager) {
+            mutableStateOf(lazyPager?.currentSnapshot() ?: LazyBookSnapshot.empty(book.title))
+        }
+        val lazySnapshot: LazyBookSnapshot = if (isFixedPdf) fixedPdfSnapshot!! else reflowSnapshot
+        val effectiveTotalPages = if (isFixedPdf) pdfPageCount else lazySnapshot.totalPages.coerceAtLeast(1)
+
+        fun reportLocator(pageIdx: Int, loc: ReaderLocator) {
+            if (onUpdateLocator != null) {
+                onUpdateLocator(loc)
             } else {
-                ReaderPaginator.paginate(
-                    document = document,
-                    settings = settings,
-                    palette = palette,
-                    textMeasurer = textMeasurer,
-                    density = density,
-                    pageWidthPx = pageWidthPx,
-                    pageHeightPx = pageHeightPx
+                val page = lazySnapshot.getPage(pageIdx)
+                onUpdatePage(
+                    pageIdx,
+                    PaginatedBook(
+                        pages = listOfNotNull(page),
+                        chapterStartPages = lazySnapshot.chapterStartPages
+                    )
                 )
             }
         }
 
         val spreadStep = if (!isFixedPdf && isDualSpread) 2 else 1
-        val spreadCount = if (isFixedPdf) pdfPageCount else ((paginated.totalPages + spreadStep - 1) / spreadStep).coerceAtLeast(1)
-        val targetPageIndex = remember(paginated, state.currentLocator, isFixedPdf, pdfPageIdx) {
-            if (isFixedPdf) pdfPageIdx else paginated.pageIndexForLocator(state.currentLocator)
+        val spreadCount = if (isFixedPdf) pdfPageCount else ((effectiveTotalPages + spreadStep - 1) / spreadStep).coerceAtLeast(1)
+        val targetPageIndex = remember(lazySnapshot, state.currentLocator, isFixedPdf, pdfPageIdx) {
+            if (isFixedPdf) pdfPageIdx else lazySnapshot.pageIndexForLocator(state.currentLocator)
         }
         val initialSpread = (targetPageIndex / spreadStep).coerceIn(0, spreadCount - 1)
         val pagerState = rememberPagerState(initialPage = initialSpread) { spreadCount }
         val scrollState = rememberLazyListState()
         var lastSpreadFromPager by remember { mutableIntStateOf(initialSpread) }
 
+        // Initialize active + adjacent chunks off the UI thread when document/layout changes
+        LaunchedEffect(lazyPager) {
+            val pager = lazyPager ?: return@LaunchedEffect
+            val (snap, initialIdx) = pager.initializeAroundLocator(state.currentLocator)
+            reflowSnapshot = snap
+            val snapSpreads = ((snap.totalPages + spreadStep - 1) / spreadStep).coerceAtLeast(1)
+            val targetSpread = (initialIdx / spreadStep).coerceIn(0, snapSpreads - 1)
+            if (!pagerState.isScrollInProgress && pagerState.currentPage != targetSpread) {
+                pagerState.scrollToPage(targetSpread)
+            }
+            lastSpreadFromPager = targetSpread
+        }
+
         // Sync pager when locator jumps (TOC, Search, Scrubber, Undo Jump, font resize) without interrupting active animation
-        LaunchedEffect(targetPageIndex, spreadStep, settings.pageTurnMode, isFixedPdf) {
+        LaunchedEffect(targetPageIndex, spreadStep, settings.pageTurnMode, isFixedPdf, spreadCount) {
             if (!isFixedPdf && settings.pageTurnMode != PageTurnMode.SCROLL && settings.pageTurnMode != PageTurnMode.CURL) {
                 val targetSpread = (targetPageIndex / spreadStep).coerceIn(0, spreadCount - 1)
                 if (!pagerState.isScrollInProgress && pagerState.currentPage != targetSpread && targetSpread != lastSpreadFromPager) {
@@ -590,13 +653,13 @@ fun ReaderScreen(
         }
 
         // Persist locator when user turns pages & freeze Liquid Glass blur during turn animation
-        LaunchedEffect(pagerState.currentPage, pagerState.isScrollInProgress, paginated, settings.pageTurnMode, isFixedPdf) {
+        LaunchedEffect(pagerState.currentPage, pagerState.isScrollInProgress, lazySnapshot.version, settings.pageTurnMode, isFixedPdf) {
             if (!isFixedPdf && settings.pageTurnMode != PageTurnMode.SCROLL && settings.pageTurnMode != PageTurnMode.CURL) {
                 isPageAnimating = pagerState.isScrollInProgress
                 if (pagerState.currentPage != lastSpreadFromPager) {
                     lastSpreadFromPager = pagerState.currentPage
-                    val pageIdx = (pagerState.currentPage * spreadStep).coerceIn(0, paginated.pages.lastIndex)
-                    onUpdatePage(pageIdx, paginated)
+                    val pageIdx = (pagerState.currentPage * spreadStep).coerceIn(0, effectiveTotalPages - 1)
+                    reportLocator(pageIdx, lazySnapshot.locatorForPage(pageIdx))
                 }
             }
         }
@@ -605,12 +668,39 @@ fun ReaderScreen(
             isFixedPdf -> pdfPageIdx
             settings.pageTurnMode == PageTurnMode.SCROLL -> targetPageIndex
             settings.pageTurnMode == PageTurnMode.CURL -> targetPageIndex
-            else -> (pagerState.currentPage * spreadStep).coerceIn(0, paginated.pages.lastIndex)
+            else -> (pagerState.currentPage * spreadStep).coerceIn(0, effectiveTotalPages - 1)
         }
         val currentSpreadIdx = (currentPageIdx / spreadStep).coerceIn(0, spreadCount - 1)
-        val currentPage = paginated.pages.getOrNull(currentPageIdx)
-        val remainingInChapter = paginated.pagesRemainingInChapter(currentPageIdx)
-        val estMinutesLeft = ((paginated.totalPages - 1 - currentPageIdx) * 1.15f).roundToInt().coerceAtLeast(0)
+        val currentPage = lazySnapshot.getPage(currentPageIdx)
+        val currentChapterIndex = if (isFixedPdf) pdfPageIdx else (currentPage?.chapterIndex ?: lazySnapshot.chapterIndexForPage(currentPageIdx))
+        val currentChapterTitle = if (isFixedPdf) "Page ${pdfPageIdx + 1}" else (currentPage?.chapterTitle ?: lazySnapshot.chapterTitleForPage(currentPageIdx))
+        val remainingInChapter = lazySnapshot.pagesRemainingInChapter(currentPageIdx)
+        val estMinutesLeft = ((effectiveTotalPages - 1 - currentPageIdx) * 1.15f).roundToInt().coerceAtLeast(0)
+
+        // Pre-load ONLY active + adjacent chunks/images and evict distant pages on Dispatchers.Default / Dispatchers.IO
+        LaunchedEffect(currentPageIdx, lazySnapshot.version, isDualSpread, isFixedPdf, lazyPager, readerAreaWidthPx) {
+            if (isFixedPdf || lazyPager == null) return@LaunchedEffect
+            val (updated, anchored) = lazyPager.ensureAdjacentPagesLoaded(currentPageIdx, isDualSpread)
+            if (updated.version != reflowSnapshot.version) {
+                reflowSnapshot = updated
+            }
+            val updatedSpreads = ((updated.totalPages + spreadStep - 1) / spreadStep).coerceAtLeast(1)
+            val targetSpread = (anchored / spreadStep).coerceIn(0, updatedSpreads - 1)
+            if (anchored != currentPageIdx && !pagerState.isScrollInProgress && pagerState.currentPage != targetSpread) {
+                lastSpreadFromPager = targetSpread
+                pagerState.scrollToPage(targetSpread)
+            }
+            val adjImages = updated.imageKeysNearPage(anchored, isDualSpread)
+            if (adjImages.isNotEmpty()) {
+                ReaderDocumentCache.prewarmImageBlocks(
+                    context = context,
+                    bookUri = document.bookUri,
+                    inlineImages = document.images,
+                    imageKeys = adjImages,
+                    maxDimensionPx = readerAreaWidthPx.roundToInt().coerceIn(720, 1440)
+                )
+            }
+        }
 
         // SAF Export & Import Launchers for Milestone E CAD Studio
         val exportAnnotatedPdfLauncher = rememberLauncherForActivityResult(
@@ -699,7 +789,8 @@ fun ReaderScreen(
 
         fun navigatePageDelta(deltaSpreads: Int) {
             if (isFixedPdf) {
-                val next = (pdfPageIdx + deltaSpreads).coerceIn(0, pdfPageCount - 1)
+                val step = if (isDualPdfSpread) 2 else 1
+                val next = (pdfPageIdx + deltaSpreads * step).coerceIn(0, pdfPageCount - 1)
                 if (next != pdfPageIdx) {
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     if (motion.reduceMotion || settings.pageTurnMode == PageTurnMode.NONE) {
@@ -722,8 +813,8 @@ fun ReaderScreen(
                 if (next != currentSpreadIdx) {
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     if (motion.reduceMotion) {
-                        val pageIdx = (next * spreadStep).coerceIn(0, paginated.pages.lastIndex)
-                        onUpdatePage(pageIdx, paginated)
+                        val pageIdx = (next * spreadStep).coerceIn(0, effectiveTotalPages - 1)
+                        reportLocator(pageIdx, lazySnapshot.locatorForPage(pageIdx))
                     } else {
                         programmaticTurnRequest = next to System.currentTimeMillis()
                     }
@@ -749,16 +840,16 @@ fun ReaderScreen(
                 ReaderAction.PREV_PAGE -> navigatePageDelta(-1)
                 ReaderAction.TOGGLE_CHROME -> onToggleChrome(null)
                 ReaderAction.NEXT_CHAPTER -> {
-                    val curChap = currentPage?.chapterIndex ?: 0
+                    val curChap = currentChapterIndex
                     val nextChap = (curChap + 1).coerceAtMost(document.chapters.lastIndex)
-                    val p = paginated.chapterStartPages[nextChap] ?: 0
-                    onJumpWithUndo(paginated.locatorForPage(p))
+                    val p = lazySnapshot.chapterStartPages[nextChap] ?: 0
+                    onJumpWithUndo(lazySnapshot.locatorForPage(p))
                 }
                 ReaderAction.PREV_CHAPTER -> {
-                    val curChap = currentPage?.chapterIndex ?: 0
+                    val curChap = currentChapterIndex
                     val prevChap = (curChap - 1).coerceAtLeast(0)
-                    val p = paginated.chapterStartPages[prevChap] ?: 0
-                    onJumpWithUndo(paginated.locatorForPage(p))
+                    val p = lazySnapshot.chapterStartPages[prevChap] ?: 0
+                    onJumpWithUndo(lazySnapshot.locatorForPage(p))
                 }
                 ReaderAction.TOGGLE_THEME -> {
                     val alt = themes.firstOrNull { it.isDark != activeTheme.isDark }
@@ -819,19 +910,29 @@ fun ReaderScreen(
             }
         }
 
-        val currentBookmark = remember(state.annotations, currentPageIdx, state.currentLocator) {
+        val parsedAnnotations = remember(state.annotations) {
+            state.annotations.map { it to ReaderLocator.fromJson(it.locatorJson) }
+        }
+        val nonBookmarkAnnotationsByChapter = remember(parsedAnnotations) {
+            parsedAnnotations
+                .filter { (ann, _) -> AnnotationType.fromRaw(ann.type) != AnnotationType.BOOKMARK }
+                .groupBy({ (_, loc) -> loc?.chapterIndex ?: -1 }, { (ann, _) -> ann })
+        }
+
+        val currentBookmark = remember(parsedAnnotations, currentChapterIndex, state.currentLocator) {
             val curProg = state.currentLocator.progression
-            val curChap = currentPage?.chapterIndex ?: state.currentLocator.chapterIndex
-            state.annotations.firstOrNull { ann ->
-                if (AnnotationType.fromRaw(ann.type) != AnnotationType.BOOKMARK) return@firstOrNull false
-                val loc = ReaderLocator.fromJson(ann.locatorJson) ?: return@firstOrNull false
-                loc.chapterIndex == curChap && abs(loc.progression - curProg) < 0.025f
-            }
+            val curChap = currentChapterIndex
+            parsedAnnotations.firstOrNull { (ann, loc) ->
+                AnnotationType.fromRaw(ann.type) == AnnotationType.BOOKMARK &&
+                    loc != null &&
+                    loc.chapterIndex == curChap &&
+                    abs(loc.progression - curProg) < 0.025f
+            }?.first
         }
 
         val handleSelectionLongPress: (String, Int, Int, String, Int) -> Unit = { sliceText, charOffsetInSlice, chapIdx, chapTitle, baseCharOffset ->
             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-            val prog = currentPage?.let { paginated.locatorForPage(it.pageIndex).progression } ?: state.currentLocator.progression
+            val prog = currentPage?.let { lazySnapshot.locatorForPage(it.pageIndex).progression } ?: state.currentLocator.progression
             val draft = TextSelectionDraft.fromTapOffset(
                 fullText = sliceText,
                 tapCharOffset = charOffsetInSlice,
@@ -1032,6 +1133,7 @@ fun ReaderScreen(
                         onSelectMarkups = onSelectStudioMarkups,
                         onMoveSelectedMarkups = onMoveSelectedStudioMarkups,
                         onCalibrateSegmentMeasured = { pts -> calibrateMeasuredPts = pts },
+                        isDualPdfSpread = isDualPdfSpread,
                         modifier = Modifier.fillMaxSize()
                     )
                 } else if (settings.pageTurnMode == PageTurnMode.SCROLL) {
@@ -1045,12 +1147,7 @@ fun ReaderScreen(
                         modifier = Modifier.fillMaxSize()
                     ) {
                         items(document.chapters, key = { it.index }) { chapter ->
-                            val chapAnnotations = remember(state.annotations, chapter.index) {
-                                state.annotations.filter {
-                                    AnnotationType.fromRaw(it.type) != AnnotationType.BOOKMARK &&
-                                        (ReaderLocator.fromJson(it.locatorJson)?.chapterIndex == chapter.index)
-                                }
-                            }
+                            val chapAnnotations = nonBookmarkAnnotationsByChapter[chapter.index].orEmpty()
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -1068,7 +1165,9 @@ fun ReaderScreen(
                                         readerAreaWidthPx = readerAreaWidthPx,
                                         settings = settings,
                                         palette = palette,
+                                        bookUri = document.bookUri,
                                         images = document.images,
+                                        isScrollingOrAnimating = scrollState.isScrollInProgress,
                                         onFootnoteClick = onOpenFootnote,
                                         onImageClick = onOpenImageZoom,
                                         onWikilinkClick = { title ->
@@ -1093,6 +1192,13 @@ fun ReaderScreen(
                         }
                     }
 
+                    LaunchedEffect(state.currentLocator.chapterIndex) {
+                        val targetChap = state.currentLocator.chapterIndex.coerceIn(0, document.chapters.lastIndex)
+                        if (!scrollState.isScrollInProgress && scrollState.firstVisibleItemIndex != targetChap) {
+                            scrollState.scrollToItem(targetChap)
+                        }
+                    }
+
                     LaunchedEffect(scrollState.firstVisibleItemIndex) {
                         val chapIdx = scrollState.firstVisibleItemIndex.coerceIn(0, document.chapters.lastIndex)
                         val prog = if (document.chapters.size <= 1) 1f else chapIdx.toFloat() / (document.chapters.size - 1).toFloat()
@@ -1110,8 +1216,8 @@ fun ReaderScreen(
                         grabMode = settings.curlGrabMode,
                         reduceMotion = motion.reduceMotion,
                         onTurnToPage = { destSpread ->
-                            val pageIdx = (destSpread * spreadStep).coerceIn(0, paginated.pages.lastIndex)
-                            onUpdatePage(pageIdx, paginated)
+                            val pageIdx = (destSpread * spreadStep).coerceIn(0, effectiveTotalPages - 1)
+                            reportLocator(pageIdx, lazySnapshot.locatorForPage(pageIdx))
                         },
                         onAnimationActiveChanged = { isPageAnimating = it },
                         onCenterTap = handleTapAtRootX,
@@ -1119,8 +1225,8 @@ fun ReaderScreen(
                         modifier = Modifier.fillMaxSize()
                     ) { spreadIdx ->
                         val leftPageIdx = spreadIdx * spreadStep
-                        val leftPage = paginated.pages.getOrNull(leftPageIdx)
-                        val rightPage = if (isDualSpread) paginated.pages.getOrNull(leftPageIdx + 1) else null
+                        val leftPage = lazySnapshot.getPage(leftPageIdx)
+                        val rightPage = if (isDualSpread) lazySnapshot.getPage(leftPageIdx + 1) else null
 
                         Row(
                             modifier = Modifier
@@ -1131,12 +1237,14 @@ fun ReaderScreen(
                             if (leftPage != null) {
                                 SinglePageCanvas(
                                     page = leftPage,
-                                    annotations = state.annotations,
+                                    chapterAnnotations = nonBookmarkAnnotationsByChapter[leftPage.chapterIndex].orEmpty(),
                                     highlightVocabWords = highlightVocabWords,
                                     readerAreaWidthPx = readerAreaWidthPx,
                                     settings = settings,
                                     palette = palette,
+                                    bookUri = document.bookUri,
                                     images = document.images,
+                                    isScrollingOrAnimating = isPageAnimating,
                                     onFootnoteClick = onOpenFootnote,
                                     onImageClick = onOpenImageZoom,
                                     onWikilinkClick = { title ->
@@ -1157,6 +1265,19 @@ fun ReaderScreen(
                                         .fillMaxHeight()
                                         .padding(horizontal = horizontalPaddingDp, vertical = verticalPaddingDp)
                                 )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(22.dp),
+                                        strokeWidth = 2.dp,
+                                        color = Color(palette.accent).copy(alpha = 0.6f)
+                                    )
+                                }
                             }
 
                             if (isDualSpread) {
@@ -1183,12 +1304,14 @@ fun ReaderScreen(
                                     if (rightPage != null) {
                                         SinglePageCanvas(
                                             page = rightPage,
-                                            annotations = state.annotations,
+                                            chapterAnnotations = nonBookmarkAnnotationsByChapter[rightPage.chapterIndex].orEmpty(),
                                             highlightVocabWords = highlightVocabWords,
                                             readerAreaWidthPx = readerAreaWidthPx,
                                             settings = settings,
                                             palette = palette,
+                                            bookUri = document.bookUri,
                                             images = document.images,
+                                            isScrollingOrAnimating = isPageAnimating,
                                             onFootnoteClick = onOpenFootnote,
                                             onImageClick = onOpenImageZoom,
                                             onWikilinkClick = { title ->
@@ -1215,60 +1338,38 @@ fun ReaderScreen(
                     HorizontalPager(
                         state = pagerState,
                         beyondViewportPageCount = 1,
+                        key = { it },
                         modifier = Modifier.fillMaxSize()
                     ) { spreadIdx ->
                         val offsetFraction = (pagerState.currentPage - spreadIdx) + pagerState.currentPageOffsetFraction
-                        val transformModifier = when (settings.pageTurnMode) {
-                            PageTurnMode.SLIDE -> Modifier
-                            PageTurnMode.COVER_FLIP -> Modifier.graphicsLayer {
-                                if (!motion.reduceMotion) {
-                                    translationX = offsetFraction * size.width * 0.42f
-                                    rotationY = (offsetFraction * -34f).coerceIn(-45f, 45f)
-                                    cameraDistance = 16f * density.density
-                                    transformOrigin = TransformOrigin(if (offsetFraction >= 0f) 0f else 1f, 0.5f)
-                                    alpha = (1f - offsetFraction.absoluteValue * 0.35f).coerceIn(0f, 1f)
-                                }
-                            }
-                            PageTurnMode.STACK -> Modifier.graphicsLayer {
-                                if (!motion.reduceMotion) {
-                                    val absOff = offsetFraction.absoluteValue
-                                    if (offsetFraction < 0f) {
-                                        translationX = offsetFraction * size.width
-                                        val s = (1f - absOff * 0.09f).coerceAtLeast(0.88f)
-                                        scaleX = s
-                                        scaleY = s
-                                        alpha = (1f - absOff * 0.30f).coerceIn(0.2f, 1f)
-                                    } else {
-                                        alpha = (1f - absOff * 0.15f).coerceIn(0.4f, 1f)
-                                    }
-                                }
-                            }
-                            PageTurnMode.FADE -> Modifier.graphicsLayer {
-                                translationX = offsetFraction * size.width * 0.94f
-                                alpha = (1f - offsetFraction.absoluteValue * 1.1f).coerceIn(0f, 1f)
-                            }
-                            PageTurnMode.CURL, PageTurnMode.NONE, PageTurnMode.SCROLL -> Modifier
-                        }
+                        val transformModifier = Modifier.mochiPageTurnTransition(
+                            mode = settings.pageTurnMode,
+                            offsetFraction = offsetFraction,
+                            reduceMotion = motion.reduceMotion
+                        )
 
                         val leftPageIdx = spreadIdx * spreadStep
-                        val leftPage = paginated.pages.getOrNull(leftPageIdx)
-                        val rightPage = if (isDualSpread) paginated.pages.getOrNull(leftPageIdx + 1) else null
+                        val leftPage = lazySnapshot.getPage(leftPageIdx)
+                        val rightPage = if (isDualSpread) lazySnapshot.getPage(leftPageIdx + 1) else null
 
                         Row(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .then(transformModifier)
+                                .background(Color(palette.paperTint))
                                 .padding(bottom = 30.dp)
                         ) {
                             if (leftPage != null) {
                                 SinglePageCanvas(
                                     page = leftPage,
-                                    annotations = state.annotations,
+                                    chapterAnnotations = nonBookmarkAnnotationsByChapter[leftPage.chapterIndex].orEmpty(),
                                     highlightVocabWords = highlightVocabWords,
                                     readerAreaWidthPx = readerAreaWidthPx,
                                     settings = settings,
                                     palette = palette,
+                                    bookUri = document.bookUri,
                                     images = document.images,
+                                    isScrollingOrAnimating = isPageAnimating,
                                     onFootnoteClick = onOpenFootnote,
                                     onImageClick = onOpenImageZoom,
                                     onWikilinkClick = { title ->
@@ -1289,6 +1390,19 @@ fun ReaderScreen(
                                         .fillMaxHeight()
                                         .padding(horizontal = horizontalPaddingDp, vertical = verticalPaddingDp)
                                 )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(22.dp),
+                                        strokeWidth = 2.dp,
+                                        color = Color(palette.accent).copy(alpha = 0.6f)
+                                    )
+                                }
                             }
 
                             if (isDualSpread) {
@@ -1316,12 +1430,14 @@ fun ReaderScreen(
                                     if (rightPage != null) {
                                         SinglePageCanvas(
                                             page = rightPage,
-                                            annotations = state.annotations,
+                                            chapterAnnotations = nonBookmarkAnnotationsByChapter[rightPage.chapterIndex].orEmpty(),
                                             highlightVocabWords = highlightVocabWords,
                                             readerAreaWidthPx = readerAreaWidthPx,
                                             settings = settings,
                                             palette = palette,
+                                            bookUri = document.bookUri,
                                             images = document.images,
+                                            isScrollingOrAnimating = isPageAnimating,
                                             onFootnoteClick = onOpenFootnote,
                                             onImageClick = onOpenImageZoom,
                                             onWikilinkClick = { title ->
@@ -1450,7 +1566,7 @@ fun ReaderScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = currentPage?.chapterTitle ?: book.title,
+                            text = currentChapterTitle.ifBlank { book.title },
                             style = MaterialTheme.typography.labelSmall,
                             color = Color(palette.textSecondary).copy(alpha = 0.72f),
                             maxLines = 1,
@@ -1459,7 +1575,7 @@ fun ReaderScreen(
                         )
                         Spacer(modifier = Modifier.width(12.dp))
                         Text(
-                            text = "Page ${currentPageIdx + 1} of ${paginated.totalPages} · $remainingInChapter left in chapter",
+                            text = "Page ${currentPageIdx + 1} of $effectiveTotalPages · $remainingInChapter left in chapter",
                             style = MaterialTheme.typography.labelSmall,
                             color = Color(palette.textSecondary).copy(alpha = 0.72f)
                         )
@@ -1552,7 +1668,7 @@ fun ReaderScreen(
                 }
 
                 // PDF Text Reflow status / scanned-page fallback pill
-                val currentReflowChapIdx = currentPage?.chapterIndex ?: state.currentLocator.chapterIndex
+                val currentReflowChapIdx = currentChapterIndex
                 val isCurrentPdfPageScanned = isPdfReflowActive &&
                     !state.isExtractingPdfReflow &&
                     state.pdfReflowChapters != null &&
@@ -1601,7 +1717,7 @@ fun ReaderScreen(
                     }
                 }
 
-                // Floating Liquid Glass Top Pill (freezes blur during page curl/slide animations)
+                // Floating Liquid Glass Top Pill — clean, uncluttered hierarchy across phone & tablet
                 androidx.compose.animation.AnimatedVisibility(
                     visible = state.chromeVisible && !state.studioActive,
                     enter = fadeIn(motion.effectsDefault()) + slideInVertically(motion.spatialFast()) { -it },
@@ -1610,11 +1726,12 @@ fun ReaderScreen(
                         .align(Alignment.TopCenter)
                         .padding(horizontal = 16.dp, vertical = 10.dp)
                 ) {
+                    val isTabletChrome = widthClass != MochiWidthClass.COMPACT
                     LiquidGlassSurface(
                         shape = CircleShape,
                         elevation = 12.dp,
                         freezeBlur = isPageAnimating,
-                        modifier = Modifier.widthIn(max = 760.dp)
+                        modifier = Modifier.widthIn(max = 820.dp)
                     ) {
                         Row(
                             modifier = Modifier
@@ -1625,7 +1742,7 @@ fun ReaderScreen(
                             IconButton(onClick = onBack, modifier = Modifier.testTag("reader_back_button")) {
                                 Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = Color(palette.text))
                             }
-                            Column(modifier = Modifier.weight(1f)) {
+                            Column(modifier = Modifier.weight(1f).padding(end = 4.dp)) {
                                 Text(
                                     text = book.title,
                                     style = MaterialTheme.typography.titleSmall,
@@ -1634,32 +1751,52 @@ fun ReaderScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = currentPage?.chapterTitle ?: "",
+                                    text = currentChapterTitle,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = Color(palette.textSecondary),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
-                            IconButton(onClick = { onToggleStudioMode(null) }, modifier = Modifier.testTag("reader_studio_button")) {
-                                Icon(
-                                    Icons.Rounded.Draw,
-                                    contentDescription = "CAD Studio Markup",
-                                    tint = if (state.studioActive) Color(palette.accent) else Color(palette.text)
-                                )
-                            }
-                            if (isPdfDoc) {
-                                IconButton(
-                                    onClick = { onUpdateSettings { it.copy(pdfReflowEnabled = !it.pdfReflowEnabled) } },
-                                    modifier = Modifier.testTag("reader_pdf_reflow_toggle")
-                                ) {
+
+                            if (isTabletChrome) {
+                                IconButton(onClick = { onToggleStudioMode(null) }, modifier = Modifier.testTag("reader_studio_button")) {
                                     Icon(
-                                        Icons.Rounded.Article,
-                                        contentDescription = if (settings.pdfReflowEnabled) "Original PDF view" else "PDF Text Reflow",
-                                        tint = if (settings.pdfReflowEnabled) Color(palette.accent) else Color(palette.text)
+                                        Icons.Rounded.Draw,
+                                        contentDescription = "CAD Studio Markup",
+                                        tint = if (state.studioActive) Color(palette.accent) else Color(palette.text)
                                     )
                                 }
+                                if (isPdfDoc) {
+                                    IconButton(
+                                        onClick = { onUpdateSettings { it.copy(pdfReflowEnabled = !it.pdfReflowEnabled) } },
+                                        modifier = Modifier.testTag("reader_pdf_reflow_toggle")
+                                    ) {
+                                        Icon(
+                                            Icons.Rounded.Article,
+                                            contentDescription = if (settings.pdfReflowEnabled) "Original PDF view" else "PDF Text Reflow",
+                                            tint = if (settings.pdfReflowEnabled) Color(palette.accent) else Color(palette.text)
+                                        )
+                                    }
+                                }
+                                IconButton(onClick = { showBookmarkDialog = true }, modifier = Modifier.testTag("reader_bookmark_button")) {
+                                    Icon(
+                                        imageVector = if (currentBookmark != null) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkBorder,
+                                        contentDescription = if (currentBookmark != null) "Edit bookmark" else "Bookmark page",
+                                        tint = if (currentBookmark != null) Color(palette.accent) else Color(palette.text)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        showToc = false
+                                        showAnnotationsPanel = !showAnnotationsPanel
+                                    },
+                                    modifier = Modifier.testTag("reader_annotations_button")
+                                ) {
+                                    Icon(Icons.Rounded.Bookmarks, contentDescription = "Annotations & Highlights", tint = Color(palette.text))
+                                }
                             }
+
                             if (isFixedPdf) {
                                 IconButton(onClick = { showPdfThumbnails = true }, modifier = Modifier.testTag("reader_pdf_thumbnails_button")) {
                                     Icon(Icons.Rounded.GridView, contentDescription = "Page Thumbnails", tint = Color(palette.text))
@@ -1669,25 +1806,7 @@ fun ReaderScreen(
                                     Icon(Icons.Rounded.Search, contentDescription = "Search in book", tint = Color(palette.text))
                                 }
                             }
-                            IconButton(onClick = { showBookmarkDialog = true }, modifier = Modifier.testTag("reader_bookmark_button")) {
-                                Icon(
-                                    imageVector = if (currentBookmark != null) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkBorder,
-                                    contentDescription = if (currentBookmark != null) "Edit bookmark" else "Bookmark page",
-                                    tint = if (currentBookmark != null) Color(palette.accent) else Color(palette.text)
-                                )
-                            }
-                            IconButton(
-                                onClick = {
-                                    showToc = false
-                                    showAnnotationsPanel = !showAnnotationsPanel
-                                },
-                                modifier = Modifier.testTag("reader_annotations_button")
-                            ) {
-                                Icon(Icons.Rounded.Bookmarks, contentDescription = "Annotations & Highlights", tint = Color(palette.text))
-                            }
-                            IconButton(onClick = { showCommandPalette = true }, modifier = Modifier.testTag("reader_command_palette_button")) {
-                                Icon(Icons.Rounded.Terminal, contentDescription = "Command palette", tint = Color(palette.text))
-                            }
+
                             IconButton(
                                 onClick = {
                                     showAnnotationsPanel = false
@@ -1697,9 +1816,7 @@ fun ReaderScreen(
                             ) {
                                 Icon(Icons.AutoMirrored.Rounded.List, contentDescription = "Table of Contents", tint = Color(palette.text))
                             }
-                            IconButton(onClick = { onOpenBookInfo(book) }) {
-                                Icon(Icons.Rounded.Info, contentDescription = "Book info", tint = Color(palette.text))
-                            }
+
                             TextButton(
                                 onClick = { showAaSheet = true },
                                 modifier = Modifier.testTag("reader_aa_button")
@@ -1709,6 +1826,115 @@ fun ReaderScreen(
                                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                                     color = Color(palette.accent)
                                 )
+                            }
+
+                            Box {
+                                IconButton(
+                                    onClick = { showOverflowMenu = true },
+                                    modifier = Modifier.testTag("reader_more_button")
+                                ) {
+                                    Icon(Icons.Rounded.MoreVert, contentDescription = "More reader actions", tint = Color(palette.text))
+                                }
+                                DropdownMenu(
+                                    expanded = showOverflowMenu,
+                                    onDismissRequest = { showOverflowMenu = false }
+                                ) {
+                                    if (!isTabletChrome) {
+                                        DropdownMenuItem(
+                                            text = { Text(if (currentBookmark != null) "Edit Bookmark" else "Bookmark This Page") },
+                                            leadingIcon = {
+                                                Icon(
+                                                    if (currentBookmark != null) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkBorder,
+                                                    contentDescription = null
+                                                )
+                                            },
+                                            onClick = {
+                                                showOverflowMenu = false
+                                                showBookmarkDialog = true
+                                            },
+                                            modifier = Modifier.testTag("reader_bookmark_button")
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Highlights & Notes") },
+                                            leadingIcon = { Icon(Icons.Rounded.Bookmarks, contentDescription = null) },
+                                            onClick = {
+                                                showOverflowMenu = false
+                                                showToc = false
+                                                showAnnotationsPanel = true
+                                            },
+                                            modifier = Modifier.testTag("reader_annotations_button")
+                                        )
+                                        if (isPdfDoc) {
+                                            DropdownMenuItem(
+                                                text = { Text(if (settings.pdfReflowEnabled) "Original Fixed PDF" else "PDF Text Reflow") },
+                                                leadingIcon = { Icon(Icons.Rounded.Article, contentDescription = null) },
+                                                onClick = {
+                                                    showOverflowMenu = false
+                                                    onUpdateSettings { it.copy(pdfReflowEnabled = !it.pdfReflowEnabled) }
+                                                },
+                                                modifier = Modifier.testTag("reader_pdf_reflow_toggle")
+                                            )
+                                        }
+                                        DropdownMenuItem(
+                                            text = { Text("CAD Studio Markup") },
+                                            leadingIcon = { Icon(Icons.Rounded.Draw, contentDescription = null) },
+                                            onClick = {
+                                                showOverflowMenu = false
+                                                onToggleStudioMode(null)
+                                            },
+                                            modifier = Modifier.testTag("reader_studio_button")
+                                        )
+                                    }
+                                    if (isFixedPdf) {
+                                        DropdownMenuItem(
+                                            text = { Text(if (settings.pdfFitMode == PdfFitMode.FIT_PAGE) "Fit to Width" else "Fit Whole Page") },
+                                            leadingIcon = { Icon(Icons.Rounded.FitScreen, contentDescription = null) },
+                                            onClick = {
+                                                showOverflowMenu = false
+                                                onUpdateSettings {
+                                                    it.copy(pdfFitMode = if (it.pdfFitMode == PdfFitMode.FIT_PAGE) PdfFitMode.FIT_WIDTH else PdfFitMode.FIT_PAGE)
+                                                }
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text(if (settings.pdfSmartDarkInvert) "Disable Night PDF Invert" else "Smart Dark PDF Invert") },
+                                            leadingIcon = { Icon(Icons.Rounded.Contrast, contentDescription = null) },
+                                            onClick = {
+                                                showOverflowMenu = false
+                                                onUpdateSettings { it.copy(pdfSmartDarkInvert = !it.pdfSmartDarkInvert) }
+                                            }
+                                        )
+                                    }
+                                    if (widthClass == MochiWidthClass.EXPANDED) {
+                                        DropdownMenuItem(
+                                            text = { Text(if (settings.pageSpreadMode == PageSpreadMode.DUAL) "Single Page View" else "Two-Page Spread") },
+                                            leadingIcon = { Icon(Icons.Rounded.ViewColumn, contentDescription = null) },
+                                            onClick = {
+                                                showOverflowMenu = false
+                                                onUpdateSettings {
+                                                    it.copy(pageSpreadMode = if (it.pageSpreadMode == PageSpreadMode.DUAL) PageSpreadMode.SINGLE else PageSpreadMode.DUAL)
+                                                }
+                                            }
+                                        )
+                                    }
+                                    DropdownMenuItem(
+                                        text = { Text("Command Palette") },
+                                        leadingIcon = { Icon(Icons.Rounded.Terminal, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            showCommandPalette = true
+                                        },
+                                        modifier = Modifier.testTag("reader_command_palette_button")
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Book Details & Notes Export") },
+                                        leadingIcon = { Icon(Icons.Rounded.Info, contentDescription = null) },
+                                        onClick = {
+                                            showOverflowMenu = false
+                                            onOpenBookInfo(book)
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
@@ -1825,19 +2051,20 @@ fun ReaderScreen(
                 ) {
                     var scrubbingPage by remember { mutableStateOf<Int?>(null) }
                     val displayPage = scrubbingPage ?: currentPageIdx
-                    val displayPageObj = paginated.pages.getOrNull(displayPage)
-                    val displayRem = paginated.pagesRemainingInChapter(displayPage)
-                    val totalPagesFloat = (paginated.totalPages - 1).coerceAtLeast(1).toFloat()
-                    val chapterTicks = remember(paginated, totalPagesFloat, isFixedPdf) {
+                    val displayPageObj = lazySnapshot.getPage(displayPage)
+                    val displayChapTitle = displayPageObj?.chapterTitle ?: lazySnapshot.chapterTitleForPage(displayPage)
+                    val displayRem = lazySnapshot.pagesRemainingInChapter(displayPage)
+                    val totalPagesFloat = (effectiveTotalPages - 1).coerceAtLeast(1).toFloat()
+                    val chapterTicks = remember(lazySnapshot, totalPagesFloat, isFixedPdf) {
                         if (isFixedPdf) emptyList()
-                        else paginated.chapterStartPages.values.map { (it / totalPagesFloat).coerceIn(0f, 1f) }
+                        else lazySnapshot.chapterStartPages.values.map { (it / totalPagesFloat).coerceIn(0f, 1f) }
                     }
 
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier.widthIn(max = 720.dp)
                     ) {
-                        if (scrubbingPage != null && displayPageObj != null) {
+                        if (scrubbingPage != null && displayChapTitle.isNotBlank()) {
                             LiquidGlassSurface(
                                 shape = RoundedCornerShape(18.dp),
                                 freezeBlur = isPageAnimating,
@@ -1848,14 +2075,14 @@ fun ReaderScreen(
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     Text(
-                                        text = displayPageObj.chapterTitle,
+                                        text = displayChapTitle,
                                         style = MaterialTheme.typography.labelLarge,
                                         color = Color(palette.text),
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = "Page ${displayPage + 1} of ${paginated.totalPages}",
+                                        text = "Page ${displayPage + 1} of $effectiveTotalPages",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = Color(palette.link)
                                     )
@@ -1871,11 +2098,74 @@ fun ReaderScreen(
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 18.dp, vertical = 10.dp)
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
+                                // 1-tap ergonomic action strip matching top paid readers
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    FilterChip(
+                                        selected = false,
+                                        onClick = { executeReaderAction(ReaderAction.TOGGLE_THEME) },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = if (activeTheme.isDark) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        },
+                                        label = { Text(if (activeTheme.isDark) "Day Theme" else "Night Theme") },
+                                        modifier = Modifier.testTag("quick_theme_toggle_chip")
+                                    )
+                                    if (isPdfDoc) {
+                                        FilterChip(
+                                            selected = settings.pdfReflowEnabled,
+                                            onClick = { onUpdateSettings { it.copy(pdfReflowEnabled = !it.pdfReflowEnabled) } },
+                                            label = { Text(if (settings.pdfReflowEnabled) "Reflow On" else "Text Reflow") }
+                                        )
+                                    }
+                                    if (isFixedPdf) {
+                                        FilterChip(
+                                            selected = settings.pdfFitMode == PdfFitMode.FIT_WIDTH,
+                                            onClick = {
+                                                onUpdateSettings {
+                                                    it.copy(pdfFitMode = if (it.pdfFitMode == PdfFitMode.FIT_PAGE) PdfFitMode.FIT_WIDTH else PdfFitMode.FIT_PAGE)
+                                                }
+                                            },
+                                            label = { Text(if (settings.pdfFitMode == PdfFitMode.FIT_WIDTH) "Fit Width" else "Fit Page") }
+                                        )
+                                        FilterChip(
+                                            selected = settings.pdfSmartDarkInvert,
+                                            onClick = { onUpdateSettings { it.copy(pdfSmartDarkInvert = !it.pdfSmartDarkInvert) } },
+                                            label = { Text("PDF Invert") }
+                                        )
+                                    }
+                                    if (widthClass == MochiWidthClass.EXPANDED) {
+                                        FilterChip(
+                                            selected = settings.pageSpreadMode == PageSpreadMode.DUAL,
+                                            onClick = {
+                                                onUpdateSettings {
+                                                    it.copy(pageSpreadMode = if (it.pageSpreadMode == PageSpreadMode.DUAL) PageSpreadMode.SINGLE else PageSpreadMode.DUAL)
+                                                }
+                                            },
+                                            label = { Text("2-Page") }
+                                        )
+                                    }
+                                    FilterChip(
+                                        selected = state.autoScrollActive,
+                                        onClick = { executeReaderAction(ReaderAction.TOGGLE_AUTO_SCROLL) },
+                                        label = { Text(if (state.autoScrollActive) "Scrolling" else "Auto-Scroll") }
+                                    )
+                                }
+
                                 LiquidGlassSlider(
                                     value = displayPage.toFloat(),
-                                    onValueChange = { scrubbingPage = it.roundToInt().coerceIn(0, paginated.totalPages - 1) },
+                                    onValueChange = { scrubbingPage = it.roundToInt().coerceIn(0, effectiveTotalPages - 1) },
                                     onValueChangeFinished = {
                                         val dest = scrubbingPage ?: currentPageIdx
                                         scrubbingPage = null
@@ -1883,7 +2173,7 @@ fun ReaderScreen(
                                             if (isFixedPdf) {
                                                 onUpdateFixedPdfPage(dest, pdfPageCount)
                                             } else {
-                                                onJumpWithUndo(paginated.locatorForPage(dest))
+                                                onJumpWithUndo(lazySnapshot.locatorForPage(dest))
                                             }
                                         }
                                     },
@@ -1894,15 +2184,16 @@ fun ReaderScreen(
                                         .testTag("reader_scrubber")
                                 )
 
+                                val pct = (((displayPage + 1).toFloat() / effectiveTotalPages.coerceAtLeast(1)) * 100f).roundToInt().coerceIn(0, 100)
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
                                     Text(
                                         text = if (isFixedPdf) {
-                                            "Page ${displayPage + 1} of ${paginated.totalPages}"
+                                            "Page ${displayPage + 1} of $effectiveTotalPages ($pct%)"
                                         } else {
-                                            "Page ${displayPage + 1} of ${paginated.totalPages} · $displayRem left in chapter"
+                                            "Page ${displayPage + 1} of $effectiveTotalPages · $pct% · $displayRem left in ch."
                                         },
                                         style = MaterialTheme.typography.labelSmall,
                                         color = Color(palette.textSecondary)
@@ -1977,11 +2268,11 @@ fun ReaderScreen(
                     } else {
                         TocContentList(
                             document = document,
-                            paginated = paginated,
-                            currentChapterIndex = currentPage?.chapterIndex ?: 0,
+                            chapterStartPages = lazySnapshot.chapterStartPages,
+                            currentChapterIndex = currentChapterIndex,
                             onJumpToChapter = { chapIdx ->
-                                val p = paginated.chapterStartPages[chapIdx] ?: 0
-                                onJumpWithUndo(paginated.locatorForPage(p))
+                                val p = lazySnapshot.chapterStartPages[chapIdx] ?: 0
+                                onJumpWithUndo(lazySnapshot.locatorForPage(p))
                             },
                             onOpenBacklinkBook = { target -> onOpenBookById(target.id) },
                             modifier = Modifier.fillMaxSize()
@@ -1999,11 +2290,11 @@ fun ReaderScreen(
             ) {
                 TocContentList(
                     document = document,
-                    paginated = paginated,
-                    currentChapterIndex = currentPage?.chapterIndex ?: 0,
+                    chapterStartPages = lazySnapshot.chapterStartPages,
+                    currentChapterIndex = currentChapterIndex,
                     onJumpToChapter = { chapIdx ->
-                        val p = paginated.chapterStartPages[chapIdx] ?: 0
-                        onJumpWithUndo(paginated.locatorForPage(p))
+                        val p = lazySnapshot.chapterStartPages[chapIdx] ?: 0
+                        onJumpWithUndo(lazySnapshot.locatorForPage(p))
                         showToc = false
                     },
                     onOpenBacklinkBook = { target ->
@@ -2082,9 +2373,9 @@ fun ReaderScreen(
         if (showCommandPalette) {
             CommandPaletteDialog(
                 themes = themes,
-                totalPages = paginated.totalPages,
+                totalPages = effectiveTotalPages,
                 commands = commandItems,
-                onGoToPage = { pIdx -> onJumpWithUndo(paginated.locatorForPage(pIdx)) },
+                onGoToPage = { pIdx -> onJumpWithUndo(lazySnapshot.locatorForPage(pIdx)) },
                 onSelectTheme = onSelectGlobalTheme,
                 onDismiss = { showCommandPalette = false }
             )
@@ -2097,18 +2388,26 @@ fun ReaderScreen(
             )
         }
 
-        val zoomBytes = state.zoomImageKey?.let { key ->
-            document.images[key] ?: document.images[key.substringAfterLast('/')]
-        }
-        if (zoomBytes != null) {
+        val zoomKey = state.zoomImageKey
+        val hasZoomImage = zoomKey != null && (
+            document.images.containsKey(zoomKey) ||
+                document.images.containsKey(zoomKey.substringAfterLast('/')) ||
+                document.archiveImageKeys.contains(zoomKey) ||
+                document.archiveImageKeys.any {
+                    it.substringAfterLast('/').equals(zoomKey.substringAfterLast('/'), ignoreCase = true)
+                }
+            )
+        if (zoomKey != null && hasZoomImage) {
             FullScreenImageViewer(
-                imageBytes = zoomBytes,
+                bookUri = document.bookUri,
+                inlineImages = document.images,
+                imageKey = zoomKey,
                 onDismiss = onCloseImageZoom
             )
         }
 
         if (showBookmarkDialog) {
-            val curLoc = currentPage?.let { paginated.locatorForPage(it.pageIndex) } ?: state.currentLocator
+            val curLoc = currentPage?.let { lazySnapshot.locatorForPage(it.pageIndex) } ?: state.currentLocator
             BookmarkDialog(
                 chapterTitle = curLoc.chapterTitle.ifBlank { book.title },
                 pageNumber = currentPageIdx + 1,
@@ -2411,6 +2710,8 @@ fun ReaderScreen(
     }
 }
 
+private val MOCHI_WORD_REGEX = Regex("[\\p{L}][\\p{L}'’-]*")
+
 private data class DecoratedHighlightRange(
     val start: Int,
     val end: Int,
@@ -2472,8 +2773,7 @@ private fun buildDecoratedSliceText(
         }
 
         if (vocabTerms.isNotEmpty()) {
-            val wordRegex = Regex("[\\p{L}][\\p{L}'’-]*")
-            wordRegex.findAll(plain).forEach { match ->
+            MOCHI_WORD_REGEX.findAll(plain).forEach { match ->
                 val norm = EnglishLemmatizer.normalizeToken(match.value)
                 val lemmas = EnglishLemmatizer.candidateLemmas(norm)
                 val matchedTerm = lemmas.firstOrNull { it in vocabTerms }
@@ -2498,8 +2798,7 @@ private fun buildDecoratedSliceText(
 
 private fun extractWordAndSentenceAt(text: String, offset: Int): Pair<String, String>? {
     if (text.isBlank() || offset < 0 || offset >= text.length) return null
-    val wordRegex = Regex("[\\p{L}][\\p{L}'’-]*")
-    val match = wordRegex.findAll(text).firstOrNull { offset in it.range.first..(it.range.last + 1) }
+    val match = MOCHI_WORD_REGEX.findAll(text).firstOrNull { offset in it.range.first..(it.range.last + 1) }
         ?: return null
     val sentStart = text.lastIndexOfAny(charArrayOf('.', '!', '?', '\n'), (match.range.first - 1).coerceAtLeast(0))
         .let { if (it < 0) 0 else it + 1 }
@@ -2644,12 +2943,14 @@ private fun AnnotatedReaderText(
 @Composable
 private fun SinglePageCanvas(
     page: ReaderPage,
-    annotations: List<AnnotationEntity>,
+    chapterAnnotations: List<AnnotationEntity>,
     highlightVocabWords: List<VocabularyWordEntity>,
     readerAreaWidthPx: Float,
     settings: ReaderSettings,
     palette: MochiThemePalette,
+    bookUri: String,
     images: Map<String, ByteArray>,
+    isScrollingOrAnimating: Boolean,
     onFootnoteClick: (String) -> Unit,
     onImageClick: (String) -> Unit,
     onWikilinkClick: (String) -> Unit,
@@ -2659,12 +2960,7 @@ private fun SinglePageCanvas(
     onSliceLongPress: (String, Int, Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val pageAnnotations = remember(annotations, page.chapterIndex) {
-        annotations.filter {
-            AnnotationType.fromRaw(it.type) != AnnotationType.BOOKMARK &&
-                (ReaderLocator.fromJson(it.locatorJson)?.chapterIndex == page.chapterIndex)
-        }
-    }
+    val pageAnnotations = chapterAnnotations
 
     Column(
         modifier = modifier,
@@ -2714,7 +3010,9 @@ private fun SinglePageCanvas(
                         readerAreaWidthPx = readerAreaWidthPx,
                         settings = settings,
                         palette = palette,
+                        bookUri = bookUri,
                         images = images,
+                        isScrollingOrAnimating = isScrollingOrAnimating,
                         onFootnoteClick = onFootnoteClick,
                         onImageClick = onImageClick,
                         onWikilinkClick = onWikilinkClick,
@@ -2741,7 +3039,9 @@ private fun RenderRichOrTextBlock(
     readerAreaWidthPx: Float,
     settings: ReaderSettings,
     palette: MochiThemePalette,
+    bookUri: String,
     images: Map<String, ByteArray>,
+    isScrollingOrAnimating: Boolean = false,
     onFootnoteClick: (String) -> Unit,
     onImageClick: (String) -> Unit,
     onWikilinkClick: (String) -> Unit,
@@ -2937,10 +3237,25 @@ private fun RenderRichOrTextBlock(
             }
         }
         is ContentBlock.ImageBlock -> {
-            val bytes = images[block.imageKey] ?: images[block.imageKey.substringAfterLast('/')]
-            val bitmap = remember(bytes) {
-                bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+            val context = LocalContext.current
+            val maxDecodeDim = if (isScrollingOrAnimating) 960 else 1280
+            val imgCacheKey = ReaderDocumentCache.imageCacheKey(bookUri, block.imageKey, maxDecodeDim)
+            val decodedBitmap by produceState(
+                initialValue = ReaderDocumentCache.getCachedImageBlock(imgCacheKey),
+                key1 = imgCacheKey,
+                key2 = bookUri
+            ) {
+                if (value == null) {
+                    value = ReaderDocumentCache.loadAndDecodeImageBlock(
+                        context = context,
+                        bookUri = bookUri,
+                        inlineImages = images,
+                        imageKey = block.imageKey,
+                        maxDimensionPx = maxDecodeDim
+                    )
+                }
             }
+            val bitmap = remember(decodedBitmap) { decodedBitmap?.takeIf { !it.isRecycled }?.asImageBitmap() }
             if (bitmap != null) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,

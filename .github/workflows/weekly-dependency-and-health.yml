@@ -1,0 +1,101 @@
+name: Weekly Health, APK Size & Policy Audit
+
+on:
+  schedule:
+    - cron: '0 10 * * 0' # Every Sunday 10:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-health
+  cancel-in-progress: false
+
+jobs:
+  health-audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check Google Play Manifest & Permission Hygiene
+        run: |
+          MANIFEST="app/src/main/AndroidManifest.xml"
+          FORBIDDEN="READ_EXTERNAL_STORAGE WRITE_EXTERNAL_STORAGE MANAGE_EXTERNAL_STORAGE READ_MEDIA_IMAGES READ_MEDIA_VIDEO REQUEST_INSTALL_PACKAGES"
+          for perm in $FORBIDDEN; do
+            if grep -q "$perm" "$MANIFEST"; then
+              echo "ERROR: Prohibited/overbroad permission detected in $MANIFEST: $perm"
+              exit 1
+            fi
+          done
+          echo "Play manifest hygiene passed (no broad storage or install permissions)."
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Configure Signing for Release Audit
+        run: |
+          if [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > my-upload-key.jks
+            cp my-upload-key.jks app/my-upload-key.jks
+          fi
+
+      - name: Run Full Test Suite, Lint & Release APK Audit
+        run: |
+          cat << 'EOF' > init-audit-signing.gradle.kts
+          allprojects {
+            afterEvaluate {
+              extensions.findByName("android")?.let { androidExt ->
+                val signingConfigs = androidExt.javaClass.getMethod("getSigningConfigs").invoke(androidExt)
+                val releaseConfig = signingConfigs.javaClass.getMethod("findByName", String::class.java).invoke(signingConfigs, "release")
+                if (releaseConfig != null && rootProject.file("my-upload-key.jks").exists()) {
+                  releaseConfig.javaClass.getMethod("setStoreFile", java.io.File::class.java).invoke(releaseConfig, rootProject.file("my-upload-key.jks"))
+                  releaseConfig.javaClass.getMethod("setStorePassword", String::class.java).invoke(releaseConfig, "android")
+                  releaseConfig.javaClass.getMethod("setKeyAlias", String::class.java).invoke(releaseConfig, "androiddebugkey")
+                  releaseConfig.javaClass.getMethod("setKeyPassword", String::class.java).invoke(releaseConfig, "android")
+                }
+              }
+            }
+          }
+          EOF
+          gradle testDebugUnitTest lintDebug assembleRelease --init-script init-audit-signing.gradle.kts
+          rm -f init-audit-signing.gradle.kts my-upload-key.jks app/my-upload-key.jks
+
+      - name: Publish Health Summary
+        run: |
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          APK_BYTES=$(stat -c%s "$APK_PATH")
+          APK_MB=$(awk "BEGIN {printf \"%.2f\", ${APK_BYTES}/1048576}")
+          COMMITS=$(git rev-list --count HEAD)
+          {
+            echo "## Weekly Mochi Reader Health Audit"
+            echo ""
+            echo "- **Release APK Size:** ${APK_MB} MB (${APK_BYTES} bytes)"
+            echo "- **Commit Count:** ${COMMITS}"
+            echo "- **Manifest Policy Check:** Passed"
+            echo "- **Unit & Robolectric Tests:** Passed"
+            echo "- **Android Lint:** Passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Lint Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-health-reports
+          path: |
+            app/build/reports/lint-results-debug.html
+            app/build/reports/tests/testDebugUnitTest/
+          retention-days: 14
+          if-no-files-found: ignore

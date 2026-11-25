@@ -221,14 +221,12 @@ fun FoldersTreeView(
                                 color = Color(palette.textSecondary)
                             )
                         }
-                        if (folder.treeUri != "samples://local") {
-                            IconButton(onClick = { onRemoveFolder(folder.treeUri) }) {
-                                Icon(
-                                    imageVector = Icons.Rounded.DeleteOutline,
-                                    contentDescription = "Remove folder",
-                                    tint = Color(palette.textSecondary)
-                                )
-                            }
+                        IconButton(onClick = { onRemoveFolder(folder.treeUri) }) {
+                            Icon(
+                                imageVector = Icons.Rounded.DeleteOutline,
+                                contentDescription = "Remove folder",
+                                tint = Color(palette.textSecondary)
+                            )
                         }
                     }
                 }

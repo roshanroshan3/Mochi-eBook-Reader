@@ -97,6 +97,8 @@ data class PaginatedBook(
 object ReaderFontResolver {
     data class FontOption(val id: String, val label: String, val family: FontFamily)
 
+    private val customFontCache = java.util.concurrent.ConcurrentHashMap<String, FontFamily>()
+
     val builtInFonts = listOf(
         FontOption("literata", "Literata", LiterataFontFamily),
         FontOption("inter", "Inter", InterFontFamily),
@@ -108,11 +110,16 @@ object ReaderFontResolver {
 
     fun resolve(fontId: String, imported: List<ImportedFontInfo>): FontFamily {
         builtInFonts.find { it.id == fontId }?.let { return it.family }
-        val custom = imported.find { it.id == fontId }
-        if (custom != null && File(custom.filePath).exists()) {
-            runCatching {
-                val tf = Typeface.createFromFile(custom.filePath)
-                return FontFamily(tf)
+        val custom = imported.find { it.id == fontId } ?: return LiterataFontFamily
+        val cacheKey = "${custom.id}:${custom.filePath}"
+        customFontCache[cacheKey]?.let { return it }
+        if (File(custom.filePath).exists()) {
+            val loaded = runCatching {
+                FontFamily(Typeface.createFromFile(custom.filePath))
+            }.getOrNull()
+            if (loaded != null) {
+                customFontCache[cacheKey] = loaded
+                return loaded
             }
         }
         return LiterataFontFamily
@@ -194,17 +201,27 @@ object ReaderPaginator {
         }
     }
 
-    fun paginate(
-        document: ParsedDocument,
+    data class ChunkPaginationResult(
+        val pages: List<ReaderPage>,
+        val endCharOffset: Int
+    )
+
+    fun paginateBlockRange(
+        blocks: List<ContentBlock>,
+        chapterIndex: Int,
+        chapterTitle: String,
+        initialCharOffset: Int,
+        startingPageIndex: Int,
+        isComic: Boolean,
         settings: ReaderSettings,
         palette: MochiThemePalette,
         textMeasurer: TextMeasurer,
         density: Density,
         pageWidthPx: Int,
         pageHeightPx: Int
-    ): PaginatedBook {
+    ): ChunkPaginationResult {
         if (pageWidthPx <= 40 || pageHeightPx <= 40) {
-            return PaginatedBook(emptyList(), emptyMap())
+            return ChunkPaginationResult(emptyList(), initialCharOffset)
         }
 
         val fontFamily = ReaderFontResolver.resolve(settings.fontId, settings.importedFonts)
@@ -218,195 +235,228 @@ object ReaderPaginator {
         )
         val paraGapPx = with(density) { settings.paragraphSpacingDp.dp.toPx() }
         val indentSpaces = if (settings.firstLineIndentDp >= 8f) "\u2003\u2003" else ""
+        val quoteIndentPx = with(density) { 20.dp.toPx() }.toInt()
+
+        val pages = mutableListOf<ReaderPage>()
+        var currentSlices = mutableListOf<PageSlice>()
+        var usedHeightPx = 0f
+        var pageCharStart = initialCharOffset
+        var runningCharOffset = initialCharOffset
+
+        fun flushPage() {
+            if (currentSlices.isNotEmpty()) {
+                pages.add(
+                    ReaderPage(
+                        pageIndex = startingPageIndex + pages.size,
+                        chapterIndex = chapterIndex,
+                        chapterTitle = chapterTitle,
+                        startCharOffset = pageCharStart,
+                        endCharOffset = runningCharOffset.coerceAtLeast(pageCharStart),
+                        slices = currentSlices.toList()
+                    )
+                )
+                currentSlices = mutableListOf()
+                usedHeightPx = 0f
+                pageCharStart = runningCharOffset
+            }
+        }
+
+        if (isComic) {
+            blocks.forEach { block ->
+                pages.add(
+                    ReaderPage(
+                        pageIndex = startingPageIndex + pages.size,
+                        chapterIndex = chapterIndex,
+                        chapterTitle = chapterTitle,
+                        startCharOffset = 0,
+                        endCharOffset = 1,
+                        slices = listOf(PageSlice.RichBlockSlice(block, 0))
+                    )
+                )
+            }
+            return ChunkPaginationResult(pages, runningCharOffset)
+        }
+
+        for (block in blocks) {
+            when (block) {
+                is ContentBlock.Heading -> {
+                    val scale = when (block.level) {
+                        1 -> 1.48f
+                        2 -> 1.28f
+                        3 -> 1.15f
+                        else -> 1.06f
+                    }
+                    val hStyle = bodyStyle.copy(
+                        fontSize = (settings.fontSizeSp * scale).sp,
+                        lineHeight = (settings.fontSizeSp * scale * 1.28f).sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Start
+                    )
+                    val annotated = toAnnotatedString(block.content, palette, hyphenate = false)
+                    val measured = textMeasurer.measure(
+                        text = annotated,
+                        style = hStyle,
+                        constraints = Constraints(maxWidth = pageWidthPx)
+                    )
+                    val h = measured.size.height.toFloat() + paraGapPx * 1.4f
+                    if (usedHeightPx > 0f && usedHeightPx + h > pageHeightPx) {
+                        flushPage()
+                    }
+                    val charEnd = runningCharOffset + annotated.length
+                    currentSlices.add(PageSlice.TextBlockSlice(annotated, hStyle, false, runningCharOffset, charEnd))
+                    usedHeightPx += h
+                    runningCharOffset = charEnd + 1
+                }
+
+                is ContentBlock.Paragraph, is ContentBlock.Blockquote -> {
+                    val isQuote = block is ContentBlock.Blockquote
+                    val rawStyled = if (block is ContentBlock.Paragraph) block.content else (block as ContentBlock.Blockquote).content
+                    val applyIndent = block is ContentBlock.Paragraph && !block.isFirstAfterHeading && indentSpaces.isNotEmpty()
+                    val effectiveStyled = if (applyIndent) {
+                        rawStyled.copy(
+                            text = indentSpaces + rawStyled.text,
+                            spans = rawStyled.spans.map { it.copy(start = it.start + indentSpaces.length, end = it.end + indentSpaces.length) }
+                        )
+                    } else rawStyled
+
+                    val pStyle = if (isQuote) {
+                        bodyStyle.copy(fontStyle = FontStyle.Italic, color = Color(palette.textSecondary))
+                    } else bodyStyle
+
+                    val annotated = toAnnotatedString(effectiveStyled, palette, settings.hyphenationEnabled)
+                    val widthLimit = if (isQuote) (pageWidthPx - quoteIndentPx).coerceAtLeast(80) else pageWidthPx
+                    val measured = textMeasurer.measure(
+                        text = annotated,
+                        style = pStyle,
+                        constraints = Constraints(maxWidth = widthLimit)
+                    )
+
+                    var lineStartIdx = 0
+                    while (lineStartIdx < measured.lineCount) {
+                        val remainingPx = (pageHeightPx - usedHeightPx).coerceAtLeast(0f)
+                        val firstLineHeight = measured.getLineBottom(lineStartIdx) - measured.getLineTop(lineStartIdx)
+                        if (usedHeightPx > 0f && remainingPx < firstLineHeight + 4f) {
+                            flushPage()
+                            continue
+                        }
+
+                        var lineEndIdx = lineStartIdx
+                        while (lineEndIdx + 1 < measured.lineCount) {
+                            val nextSliceHeight = measured.getLineBottom(lineEndIdx + 1) - measured.getLineTop(lineStartIdx)
+                            if (nextSliceHeight <= (pageHeightPx - usedHeightPx)) {
+                                lineEndIdx++
+                            } else {
+                                break
+                            }
+                        }
+
+                        val charStartInBlock = measured.getLineStart(lineStartIdx)
+                        val charEndInBlock = measured.getLineEnd(lineEndIdx, visibleEnd = true).coerceIn(charStartInBlock, annotated.length)
+                        val subText = annotated.subSequence(charStartInBlock, charEndInBlock)
+                        val sliceH = (measured.getLineBottom(lineEndIdx) - measured.getLineTop(lineStartIdx)) +
+                            if (lineEndIdx == measured.lineCount - 1) paraGapPx else 0f
+
+                        currentSlices.add(
+                            PageSlice.TextBlockSlice(
+                                text = subText,
+                                style = pStyle,
+                                isBlockquote = isQuote,
+                                chapterCharStart = runningCharOffset + charStartInBlock,
+                                chapterCharEnd = runningCharOffset + charEndInBlock
+                            )
+                        )
+                        usedHeightPx += sliceH
+                        lineStartIdx = lineEndIdx + 1
+
+                        if (lineStartIdx < measured.lineCount) {
+                            flushPage()
+                        }
+                    }
+                    runningCharOffset += annotated.length + 1
+                }
+
+                is ContentBlock.FrontMatterCard -> {
+                    val estH = with(density) { (48 + block.entries.size * 22).dp.toPx() }
+                    if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
+                    currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
+                    usedHeightPx += estH + paraGapPx
+                }
+
+                is ContentBlock.CodeBlock -> {
+                    val lineCount = block.code.lines().size.coerceIn(2, 24)
+                    val estH = with(density) { (36 + lineCount * 20).dp.toPx() }.coerceAtMost(pageHeightPx * 0.85f)
+                    if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
+                    currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
+                    usedHeightPx += estH + paraGapPx
+                    runningCharOffset += block.code.length + 1
+                }
+
+                is ContentBlock.TableBlock -> {
+                    val estH = with(density) { ((block.rows.size + 1) * 34 + 20).dp.toPx() }.coerceAtMost(pageHeightPx * 0.85f)
+                    if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
+                    currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
+                    usedHeightPx += estH + paraGapPx
+                }
+
+                is ContentBlock.ListBlock -> {
+                    val estH = with(density) { (block.items.size * 30 + 12).dp.toPx() }.coerceAtMost(pageHeightPx * 0.85f)
+                    if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
+                    currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
+                    usedHeightPx += estH + paraGapPx
+                }
+
+                is ContentBlock.ImageBlock -> {
+                    val estH = (pageHeightPx * 0.45f).coerceAtLeast(180f)
+                    if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
+                    currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
+                    usedHeightPx += estH + paraGapPx
+                }
+
+                ContentBlock.Divider -> {
+                    val estH = with(density) { 24.dp.toPx() }
+                    if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
+                    currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
+                    usedHeightPx += estH
+                }
+            }
+        }
+        flushPage()
+        return ChunkPaginationResult(pages, runningCharOffset)
+    }
+
+    fun paginate(
+        document: ParsedDocument,
+        settings: ReaderSettings,
+        palette: MochiThemePalette,
+        textMeasurer: TextMeasurer,
+        density: Density,
+        pageWidthPx: Int,
+        pageHeightPx: Int
+    ): PaginatedBook {
+        if (pageWidthPx <= 40 || pageHeightPx <= 40) {
+            return PaginatedBook(emptyList(), emptyMap())
+        }
 
         val pages = mutableListOf<ReaderPage>()
         val chapterStarts = mutableMapOf<Int, Int>()
 
         for (chapter in document.chapters) {
             chapterStarts[chapter.index] = pages.size
-            var currentSlices = mutableListOf<PageSlice>()
-            var usedHeightPx = 0f
-            var pageCharStart = 0
-            var runningCharOffset = 0
-
-            fun flushPage() {
-                if (currentSlices.isNotEmpty()) {
-                    pages.add(
-                        ReaderPage(
-                            pageIndex = pages.size,
-                            chapterIndex = chapter.index,
-                            chapterTitle = chapter.title,
-                            startCharOffset = pageCharStart,
-                            endCharOffset = runningCharOffset.coerceAtLeast(pageCharStart),
-                            slices = currentSlices.toList()
-                        )
-                    )
-                    currentSlices = mutableListOf()
-                    usedHeightPx = 0f
-                    pageCharStart = runningCharOffset
-                }
-            }
-
-            if (document.isComic) {
-                chapter.blocks.forEach { block ->
-                    pages.add(
-                        ReaderPage(
-                            pageIndex = pages.size,
-                            chapterIndex = chapter.index,
-                            chapterTitle = chapter.title,
-                            startCharOffset = 0,
-                            endCharOffset = 1,
-                            slices = listOf(PageSlice.RichBlockSlice(block, 0))
-                        )
-                    )
-                }
-                continue
-            }
-
-            for (block in chapter.blocks) {
-                when (block) {
-                    is ContentBlock.Heading -> {
-                        val scale = when (block.level) {
-                            1 -> 1.48f
-                            2 -> 1.28f
-                            3 -> 1.15f
-                            else -> 1.06f
-                        }
-                        val hStyle = bodyStyle.copy(
-                            fontSize = (settings.fontSizeSp * scale).sp,
-                            lineHeight = (settings.fontSizeSp * scale * 1.28f).sp,
-                            fontWeight = FontWeight.Bold,
-                            textAlign = TextAlign.Start
-                        )
-                        val annotated = toAnnotatedString(block.content, palette, hyphenate = false)
-                        val measured = textMeasurer.measure(
-                            text = annotated,
-                            style = hStyle,
-                            constraints = Constraints(maxWidth = pageWidthPx)
-                        )
-                        val h = measured.size.height.toFloat() + paraGapPx * 1.4f
-                        if (usedHeightPx > 0f && usedHeightPx + h > pageHeightPx) {
-                            flushPage()
-                        }
-                        val charEnd = runningCharOffset + annotated.length
-                        currentSlices.add(PageSlice.TextBlockSlice(annotated, hStyle, false, runningCharOffset, charEnd))
-                        usedHeightPx += h
-                        runningCharOffset = charEnd + 1
-                    }
-
-                    is ContentBlock.Paragraph, is ContentBlock.Blockquote -> {
-                        val isQuote = block is ContentBlock.Blockquote
-                        val rawStyled = if (block is ContentBlock.Paragraph) block.content else (block as ContentBlock.Blockquote).content
-                        val applyIndent = block is ContentBlock.Paragraph && !block.isFirstAfterHeading && indentSpaces.isNotEmpty()
-                        val effectiveStyled = if (applyIndent) {
-                            rawStyled.copy(
-                                text = indentSpaces + rawStyled.text,
-                                spans = rawStyled.spans.map { it.copy(start = it.start + indentSpaces.length, end = it.end + indentSpaces.length) }
-                            )
-                        } else rawStyled
-
-                        val pStyle = if (isQuote) {
-                            bodyStyle.copy(fontStyle = FontStyle.Italic, color = Color(palette.textSecondary))
-                        } else bodyStyle
-
-                        val annotated = toAnnotatedString(effectiveStyled, palette, settings.hyphenationEnabled)
-                        val widthLimit = if (isQuote) (pageWidthPx - with(density) { 20.dp.toPx() }.toInt()).coerceAtLeast(80) else pageWidthPx
-                        val measured = textMeasurer.measure(
-                            text = annotated,
-                            style = pStyle,
-                            constraints = Constraints(maxWidth = widthLimit)
-                        )
-
-                        var lineStartIdx = 0
-                        while (lineStartIdx < measured.lineCount) {
-                            val remainingPx = (pageHeightPx - usedHeightPx).coerceAtLeast(0f)
-                            val firstLineHeight = measured.getLineBottom(lineStartIdx) - measured.getLineTop(lineStartIdx)
-                            if (usedHeightPx > 0f && remainingPx < firstLineHeight + 4f) {
-                                flushPage()
-                                continue
-                            }
-
-                            var lineEndIdx = lineStartIdx
-                            while (lineEndIdx + 1 < measured.lineCount) {
-                                val nextSliceHeight = measured.getLineBottom(lineEndIdx + 1) - measured.getLineTop(lineStartIdx)
-                                if (nextSliceHeight <= (pageHeightPx - usedHeightPx)) {
-                                    lineEndIdx++
-                                } else {
-                                    break
-                                }
-                            }
-
-                            val charStartInBlock = measured.getLineStart(lineStartIdx)
-                            val charEndInBlock = measured.getLineEnd(lineEndIdx, visibleEnd = true).coerceIn(charStartInBlock, annotated.length)
-                            val subText = annotated.subSequence(charStartInBlock, charEndInBlock)
-                            val sliceH = (measured.getLineBottom(lineEndIdx) - measured.getLineTop(lineStartIdx)) +
-                                if (lineEndIdx == measured.lineCount - 1) paraGapPx else 0f
-
-                            currentSlices.add(
-                                PageSlice.TextBlockSlice(
-                                    text = subText,
-                                    style = pStyle,
-                                    isBlockquote = isQuote,
-                                    chapterCharStart = runningCharOffset + charStartInBlock,
-                                    chapterCharEnd = runningCharOffset + charEndInBlock
-                                )
-                            )
-                            usedHeightPx += sliceH
-                            lineStartIdx = lineEndIdx + 1
-
-                            if (lineStartIdx < measured.lineCount) {
-                                flushPage()
-                            }
-                        }
-                        runningCharOffset += annotated.length + 1
-                    }
-
-                    is ContentBlock.FrontMatterCard -> {
-                        val estH = with(density) { (48 + block.entries.size * 22).dp.toPx() }
-                        if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
-                        currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
-                        usedHeightPx += estH + paraGapPx
-                    }
-
-                    is ContentBlock.CodeBlock -> {
-                        val lineCount = block.code.lines().size.coerceIn(2, 24)
-                        val estH = with(density) { (36 + lineCount * 20).dp.toPx() }.coerceAtMost(pageHeightPx * 0.85f)
-                        if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
-                        currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
-                        usedHeightPx += estH + paraGapPx
-                        runningCharOffset += block.code.length + 1
-                    }
-
-                    is ContentBlock.TableBlock -> {
-                        val estH = with(density) { ((block.rows.size + 1) * 34 + 20).dp.toPx() }.coerceAtMost(pageHeightPx * 0.85f)
-                        if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
-                        currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
-                        usedHeightPx += estH + paraGapPx
-                    }
-
-                    is ContentBlock.ListBlock -> {
-                        val estH = with(density) { (block.items.size * 30 + 12).dp.toPx() }.coerceAtMost(pageHeightPx * 0.85f)
-                        if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
-                        currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
-                        usedHeightPx += estH + paraGapPx
-                    }
-
-                    is ContentBlock.ImageBlock -> {
-                        val estH = (pageHeightPx * 0.45f).coerceAtLeast(180f)
-                        if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
-                        currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
-                        usedHeightPx += estH + paraGapPx
-                    }
-
-                    ContentBlock.Divider -> {
-                        val estH = with(density) { 24.dp.toPx() }
-                        if (usedHeightPx > 0f && usedHeightPx + estH > pageHeightPx) flushPage()
-                        currentSlices.add(PageSlice.RichBlockSlice(block, runningCharOffset))
-                        usedHeightPx += estH
-                    }
-                }
-            }
-            flushPage()
+            val result = paginateBlockRange(
+                blocks = chapter.blocks,
+                chapterIndex = chapter.index,
+                chapterTitle = chapter.title,
+                initialCharOffset = 0,
+                startingPageIndex = pages.size,
+                isComic = document.isComic,
+                settings = settings,
+                palette = palette,
+                textMeasurer = textMeasurer,
+                density = density,
+                pageWidthPx = pageWidthPx,
+                pageHeightPx = pageHeightPx
+            )
+            pages.addAll(result.pages)
         }
 
         if (pages.isEmpty()) {

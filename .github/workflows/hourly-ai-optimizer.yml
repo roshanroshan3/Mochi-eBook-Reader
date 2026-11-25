@@ -4,9 +4,24 @@ on:
   schedule:
     - cron: '15 20 */2 * *' # 02:00 AM Nepal Time (GMT+05:45) every 2 days
   workflow_dispatch:
+    inputs:
+      focus_area:
+        description: "Focus area for AI scrutiny & optimization"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - performance
+          - ui_ux
+          - pdf_engine
+          - stability
 
 permissions:
   contents: write
+
+concurrency:
+  group: ai-optimizer
+  cancel-in-progress: false
 
 jobs:
   optimize-slice:
@@ -17,6 +32,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 20
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5
@@ -40,100 +56,186 @@ jobs:
       - name: Analyze & Optimize Core Code Slice
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_OPTIMIZER_MODEL: ${{ vars.GEMINI_OPTIMIZER_MODEL }}
+          FOCUS_AREA: ${{ inputs.focus_area || 'auto' }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           python3 - << 'EOF'
-          import os, glob, random, json, time
+          import os, glob, random, json, time, subprocess
           from google import genai
           from google.genai import types
 
           api_key = os.environ.get("GEMINI_API_KEY", "").strip()
           if not api_key:
-              raise ValueError("GEMINI_API_KEY secret is missing.")
+              print("GEMINI_API_KEY secret is not configured; skipping run cleanly.")
+              exit(0)
 
           client = genai.Client(api_key=api_key)
 
-          all_kt = glob.glob("app/src/main/java/**/*.kt", recursive=True)
-          priority = [f for f in all_kt if any(k in f for k in ["ReaderScreen", "PdfPageEngine", "LibraryScreen", "DocumentParsers"])]
-          pool = priority if priority and random.random() < 0.7 else all_kt
-          target_files = random.sample(pool, min(2, len(pool)))
-          print("Scrutinizing:", target_files)
+          focus_area = os.environ.get("FOCUS_AREA", "auto").strip()
+          if focus_area == "auto":
+              run_num = int(os.environ.get("RUN_NUMBER", "0") or "0")
+              cycle = ["performance", "ui_ux", "pdf_engine", "stability"]
+              focus_area = cycle[run_num % len(cycle)]
 
-          files_payload = {p: open(p, "r", encoding="utf-8").read() for p in target_files}
+          focus_instructions = {
+              "performance": (
+                  "Eliminate unnecessary Jetpack Compose recompositions, heavy allocations during draw/scroll/drag frames, "
+                  "unbounded bitmaps, or main-thread disk/JSON decoding. Keep caches memory-bounded and thread-safe."
+              ),
+              "ui_ux": (
+                  "Elevate Material 3 Expressive visual polish, tablet responsiveness (MochiWidthClass.EXPANDED/MEDIUM), "
+                  "1-tap reader ergonomics, clear typography/contrast, and TalkBack accessibility labels + 48dp touch targets."
+              ),
+              "pdf_engine": (
+                  "Improve PDF/EPUB/CBZ parsing fidelity, outline/TOC accuracy, margin crop precision, reflow typography, "
+                  "gesture separation (1x swipe vs pinch/pan), and neighbor pre-warming cache hit rates."
+              ),
+              "stability": (
+                  "Harden edge cases, null/OOM/IO error handling, coroutine cancellation safety, Room persistence state consistency, "
+                  "and deprecated Android/Compose API replacements."
+              ),
+          }[focus_area]
+
+          all_kt = sorted(glob.glob("app/src/main/java/**/*.kt", recursive=True))
+          priority_keys = {
+              "performance": ["ReaderScreen", "PageCurlEngine", "FixedLayoutPdfReader", "PdfPageEngine", "LiquidGlass", "ReaderPaginator"],
+              "ui_ux": ["ReaderScreen", "LibraryScreen", "ReaderOverlays", "ExpressiveComponents", "AdaptiveLayout", "AaTypography"],
+              "pdf_engine": ["PdfPageEngine", "PdfReflowExtractor", "FixedLayoutPdfReader", "DocumentParsers", "ReaderRepository"],
+              "stability": ["ReaderViewModel", "LibraryViewModel", "SafBookScanner", "AnnotationStudio", "ReadingStats"],
+          }[focus_area]
+
+          priority = [f for f in all_kt if any(k in f for k in priority_keys)]
+          pool = priority if priority and random.random() < 0.8 else all_kt
+          target_files = random.sample(pool, min(2, len(pool)))
+
+          recent_commits = subprocess.check_output(
+              ["git", "log", "-n", "8", "--oneline"], text=True
+          ).strip()
+
+          print(f"Focus: {focus_area} | Scrutinizing: {target_files}")
+
+          files_payload = {
+              p: open(p, "r", encoding="utf-8").read()
+              for p in target_files
+          }
 
           prompt = f"""
-          You are a senior Android & Jetpack Compose performance engineer optimizing an offline ebook/PDF reader app.
-          Scrutinize these Kotlin files and fix real performance and state bugs:
-          1. Eliminate full-page refreshes or re-pagination when turning pages (cache slices/bitmaps via remember/LruCache).
-          2. Pre-render adjacent pages (currentPage - 1, currentPage + 1) on Dispatchers.IO.
-          3. Persist lastReadPage, lastReadLocator, and reading history to Room cleanly without losing state.
-          4. Fix deprecated Compose/Android APIs and memory leaks.
+          You are a principal Android & Jetpack Compose engineer continuously improving Mochi Reader
+          (an offline-first EPUB/PDF/CBZ/Markdown reader competing with paid market leaders like Apple Books, Moon+ Pro, and LiquidText).
 
-          Rules:
-          - Only modify a file if you can make a safe, concrete, compiling improvement.
-          - Preserve all public class/function signatures and existing UI features.
-          - Return ONLY valid JSON:
-            {{"summary": "short commit message", "updates": [{{"path": "exact/file/path.kt", "content": "full updated file content"}}]}}
-          - If no meaningful improvement is needed, return {{"summary": "none", "updates": []}}.
+          Active 2-Day Cycle Focus ({focus_area}):
+          {focus_instructions}
+
+          Recent Commits (do NOT repeat or undo recent work):
+          {recent_commits}
+
+          Hard Safety & Architecture Rules:
+          - Preserve all public class/function/Composable signatures, Room schemas, Compose testTags, and keep reading/annotations/settings 100% local (only Project Gutenberg catalog uses network).
+          - Prefer targeted `edits` (exact verbatim `search` -> `replace` blocks) instead of rewriting huge files!
+          - Only make concrete, high-value, compiling improvements. Avoid cosmetic whitespace-only edits or adding fake/stub features.
+          - Return ONLY valid JSON matching this schema:
+            {{
+              "summary": "short imperative summary under 65 chars",
+              "edits": [
+                {{"path": "exact/file/path.kt", "search": "exact unique substring currently in file", "replace": "improved replacement substring"}}
+              ]
+            }}
+          - If the selected files are already clean and no high-value improvement is needed, return {{"summary": "none", "edits": []}}.
 
           Files:
           {json.dumps(files_payload)}
           """
 
-          response = None
-          for model_name in ["gemini-3.8-flash", "gemini-3.8-flash-lite"]:
-              try:
-                  print(f"Trying {model_name}...")
-                  response = client.models.generate_content(
-                      model=model_name,
-                      contents=prompt,
-                      config=types.GenerateContentConfig(
-                          response_mime_type="application/json",
-                          temperature=0.2,
-                      ),
-                  )
-                  break
-              except Exception as e:
-                  print(f"{model_name} unavailable ({e}), trying fallback...")
-                  time.sleep(3)
+          custom_model = os.environ.get("GEMINI_OPTIMIZER_MODEL", "").strip()
+          candidates = [m for m in [custom_model, "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"] if m]
 
-          if response is None:
-              print("All models temporarily busy (503/429). Skipping cleanly.")
+          response = None
+          for model_name in candidates:
+              for attempt in range(2):
+                  try:
+                      print(f"Trying {model_name} (attempt {attempt + 1})...")
+                      response = client.models.generate_content(
+                          model=model_name,
+                          contents=prompt,
+                          config=types.GenerateContentConfig(
+                              response_mime_type="application/json",
+                              temperature=0.2,
+                          ),
+                      )
+                      break
+                  except Exception as e:
+                      print(f"{model_name} error ({e}); retrying or falling back...")
+                      time.sleep(3 * (attempt + 1))
+              if response is not None:
+                  break
+
+          if response is None or not getattr(response, "text", None):
+              print("All Gemini models temporarily unavailable. Skipping cleanly.")
               exit(0)
 
           result = json.loads(response.text)
-          updates = result.get("updates", [])
-          if not updates:
-              print("No changes needed.")
+          edits = result.get("edits", [])
+          legacy_updates = result.get("updates", [])
+          if not edits and not legacy_updates:
+              print("No improvements needed for this slice.")
               exit(0)
 
-          for item in updates:
-              path = item["path"]
-              if path in files_payload and item["content"].strip():
+          applied = 0
+          for edit in edits:
+              path = edit.get("path", "")
+              search = edit.get("search", "")
+              replace = edit.get("replace", "")
+              if path not in files_payload or not path.startswith("app/src/") or not search or search == replace:
+                  continue
+              current = open(path, "r", encoding="utf-8").read()
+              occurrences = current.count(search)
+              if occurrences != 1:
+                  print(f"Skipping hunk in {path}: expected 1 exact match, found {occurrences}")
+                  continue
+              updated = current.replace(search, replace, 1)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(updated)
+              applied += 1
+              print(f"Applied surgical edit to: {path}")
+
+          for item in legacy_updates:
+              path = item.get("path", "")
+              content = item.get("content", "")
+              if path in files_payload and path.startswith("app/src/") and content.strip():
                   old_lines = len(files_payload[path].splitlines())
-                  new_lines = len(item["content"].splitlines())
-                  if new_lines < old_lines * 0.85:
-                      print(f"Skipping {path}: AI removed too many lines ({old_lines} -> {new_lines})")
+                  new_lines = len(content.splitlines())
+                  if old_lines > 400 or new_lines < old_lines * 0.85:
+                      print(f"Skipping unsafe full rewrite for {path} ({old_lines} -> {new_lines} lines)")
                       continue
                   with open(path, "w", encoding="utf-8") as f:
-                      f.write(item["content"])
-                  print(f"Updated: {path}")
+                      f.write(content)
+                  applied += 1
+                  print(f"Updated file: {path}")
 
+          if applied == 0:
+              print("No valid edits applied.")
+              exit(0)
+
+          summary = (result.get("summary") or f"optimize {focus_area}").strip().splitlines()[0][:72]
           with open(".ai_commit_msg", "w", encoding="utf-8") as f:
-              f.write(result.get("summary", "perf: AI code optimization"))
+              f.write(summary)
           EOF
 
-      - name: Verify Compilation Before Pushing
+      - name: Verify Build & Unit Tests Before Pushing
         id: verify
         run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            if gradle compileDebugKotlin; then
+          if [ -n "$(git status --porcelain app/src/)" ]; then
+            if gradle testDebugUnitTest; then
               echo "valid=true" >> $GITHUB_OUTPUT
             else
-              echo "Compilation failed! Reverting AI edits."
+              echo "Tests or compilation failed! Reverting AI edits safely."
               git checkout -- .
+              rm -f .ai_commit_msg
               echo "valid=false" >> $GITHUB_OUTPUT
             fi
           else
+            rm -f .ai_commit_msg
             echo "valid=false" >> $GITHUB_OUTPUT
           fi
 
@@ -146,4 +248,5 @@ jobs:
           MSG=$(cat .ai_commit_msg)
           rm -f .ai_commit_msg
           git commit -m "perf(ai): $MSG"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
           git push

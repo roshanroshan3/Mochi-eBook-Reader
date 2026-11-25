@@ -98,8 +98,20 @@ fun ShelfViewContainer(
         val isAnyShelf = shelfStyle == ShelfStyle.GLASS_SHELF || shelfStyle == ShelfStyle.WOODEN_SHELF
         // Optional user shelf background image with dim/blur sliders
         if (isAnyShelf && !shelfBackgroundUri.isNullOrBlank()) {
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val bgRequest = remember(shelfBackgroundUri) {
+                coil.request.ImageRequest.Builder(context)
+                    .data(shelfBackgroundUri)
+                    .size(1080, 1080)
+                    .precision(coil.size.Precision.INEXACT)
+                    .scale(coil.size.Scale.FILL)
+                    .allowHardware(true)
+                    .allowRgb565(true)
+                    .crossfade(200)
+                    .build()
+            }
             AsyncImage(
-                model = shelfBackgroundUri,
+                model = bgRequest,
                 contentDescription = "Shelf background",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier

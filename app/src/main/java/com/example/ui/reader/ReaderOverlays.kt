@@ -46,8 +46,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.ImageBitmap
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -68,8 +72,8 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.example.data.db.BookEntity
 import com.example.data.reader.FootnoteEntry
-import com.example.data.reader.PaginatedBook
 import com.example.data.reader.ParsedDocument
+import com.example.data.reader.ReaderDocumentCache
 import com.example.data.reader.ReaderSearchMatch
 import com.example.theme.ContrastChecker
 import com.example.theme.MochiThemePalette
@@ -79,7 +83,7 @@ import com.example.ui.theme.LocalMochiPalette
 @Composable
 fun TocContentList(
     document: ParsedDocument,
-    paginated: PaginatedBook,
+    chapterStartPages: Map<Int, Int>,
     currentChapterIndex: Int,
     onJumpToChapter: (Int) -> Unit,
     onOpenBacklinkBook: (BookEntity) -> Unit,
@@ -101,7 +105,7 @@ fun TocContentList(
         }
         items(document.chapters, key = { it.index }) { chapter ->
             val selected = chapter.index == currentChapterIndex
-            val startPage = (paginated.chapterStartPages[chapter.index] ?: 0) + 1
+            val startPage = (chapterStartPages[chapter.index] ?: 0) + 1
             Surface(
                 shape = RoundedCornerShape(14.dp),
                 color = if (selected) Color(palette.accentContainer) else Color(palette.surfaceVariant).copy(alpha = 0.45f),
@@ -270,11 +274,22 @@ fun FootnotePopoverDialog(
 
 @Composable
 fun FullScreenImageViewer(
-    imageBytes: ByteArray,
+    bookUri: String,
+    inlineImages: Map<String, ByteArray>,
+    imageKey: String,
     onDismiss: () -> Unit
 ) {
-    val bitmap = remember(imageBytes) {
-        BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)?.asImageBitmap()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, bookUri, imageKey) {
+        value = withContext(Dispatchers.IO) {
+            ReaderDocumentCache.loadAndDecodeImageBlock(
+                context = context,
+                bookUri = bookUri,
+                inlineImages = inlineImages,
+                imageKey = imageKey,
+                maxDimensionPx = 2200
+            )?.asImageBitmap()
+        }
     }
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
@@ -306,9 +321,10 @@ fun FullScreenImageViewer(
                     )
                 }
         ) {
-            if (bitmap != null) {
+            val loadedBitmap = bitmap
+            if (loadedBitmap != null) {
                 Image(
-                    bitmap = bitmap,
+                    bitmap = loadedBitmap,
                     contentDescription = "Zoomed illustration",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier

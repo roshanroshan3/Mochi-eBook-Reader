@@ -5,6 +5,7 @@ import com.example.data.annotations.AnnotationRepository
 import com.example.data.db.MochiDatabase
 import com.example.data.dictionary.DictionaryRepository
 import com.example.data.dictionary.VocabularyRepository
+import com.example.data.library.GutenbergRepository
 import com.example.data.library.LibraryRepository
 import com.example.data.preferences.MochiPreferences
 import com.example.data.reader.ReaderRepository
@@ -14,6 +15,7 @@ import com.example.data.studio.AnnotationStudioRepository
 class AppContainer(context: Context) {
     val database: MochiDatabase = MochiDatabase.build(context)
     val preferences: MochiPreferences = MochiPreferences(context)
+    val gutenbergRepository: GutenbergRepository = GutenbergRepository()
     val libraryRepository: LibraryRepository = LibraryRepository(
         context = context,
         bookDao = database.bookDao(),

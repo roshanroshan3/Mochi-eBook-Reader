@@ -9,7 +9,6 @@ import com.example.data.db.BookFormat
 import com.example.data.db.MochiDatabase
 import com.example.data.db.ReadingStatus
 import com.example.data.library.SafBookScanner
-import com.example.data.library.SampleBookSeeder
 import com.example.data.reader.ContentBlock
 import com.example.data.reader.DocumentParsers
 import com.example.data.reader.InlineSpanType
@@ -293,10 +292,17 @@ class ReaderParserAndPaginatorTest {
     }
 
     @Test
-    fun repositoryLoadsSamplesAndPersistsLocatorsAndBookThemeOverrides() = runTest {
-        val samples = SampleBookSeeder.seedIfNeeded(context)
-        val epubSample = samples.first { it.file.name.endsWith(".epub") }
-        val scanned = SafBookScanner.scanSeededSample(context, epubSample, existing = null, shelfOrder = 0)
+    fun repositoryLoadsBooksAndPersistsLocatorsAndBookThemeOverrides() = runTest {
+        val fixtures = TestBookFixtures.createAll(context)
+        val epubFixture = fixtures.first { it.file.name.endsWith(".epub") }
+        val scanned = SafBookScanner.scanLocalBookFile(
+            context = context,
+            file = epubFixture.file,
+            existing = null,
+            shelfOrder = 0,
+            fallbackTitle = epubFixture.title,
+            fallbackAuthors = epubFixture.authors
+        )
         val insertedId = db.bookDao().upsertBook(scanned)
         val book = repository.getBook(insertedId)!!
 

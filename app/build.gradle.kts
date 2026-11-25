@@ -16,8 +16,24 @@ android {
     applicationId = "app.mochireader.reader"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+
+    val versionPropsFile = rootProject.file("version.properties")
+    val propsMajor = if (versionPropsFile.exists()) {
+      versionPropsFile.readLines().firstOrNull { it.startsWith("VERSION_MAJOR=") }?.substringAfter("=")?.trim()?.toIntOrNull() ?: 1
+    } else 1
+    val propsMinor = if (versionPropsFile.exists()) {
+      versionPropsFile.readLines().firstOrNull { it.startsWith("VERSION_MINOR=") }?.substringAfter("=")?.trim()?.toIntOrNull() ?: 1
+    } else 1
+    val propsPatch = if (versionPropsFile.exists()) {
+      versionPropsFile.readLines().firstOrNull { it.startsWith("VERSION_PATCH_BASE=") }?.substringAfter("=")?.trim()?.toIntOrNull() ?: 0
+    } else 0
+
+    versionCode = System.getenv("MOCHI_VERSION_CODE")?.toIntOrNull()
+      ?: project.findProperty("mochiVersionCode")?.toString()?.toIntOrNull()
+      ?: (propsMajor * 100000 + propsMinor * 10000 + propsPatch)
+    versionName = System.getenv("MOCHI_VERSION_NAME")?.takeIf { it.isNotBlank() }
+      ?: project.findProperty("mochiVersionName")?.toString()?.takeIf { it.isNotBlank() }
+      ?: "$propsMajor.$propsMinor.$propsPatch"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -90,7 +106,7 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
-// Unused Firebase and networking dependencies are commented out for 100% offline privacy.
+// Network access is limited strictly to optional Project Gutenberg catalog & cover fetching.
 dependencies {
   implementation(platform(libs.androidx.compose.bom))
   // implementation(platform(libs.firebase.bom))
@@ -124,8 +140,8 @@ dependencies {
   implementation(libs.kotlinx.coroutines.android) // Main-safe async execution
   implementation(libs.kotlinx.coroutines.core) // Coroutine primitives and Flows
   // implementation(libs.logging.interceptor)
-  implementation(libs.moshi.kotlin) // JSON parsing for themes and .mochitheme packs
-  // implementation(libs.okhttp)
+  implementation(libs.moshi.kotlin) // JSON parsing for themes and Gutendex API
+  implementation(libs.okhttp) // HTTP client for Project Gutenberg catalog & ebook downloads
   // implementation(libs.play.services.location)
   // implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)

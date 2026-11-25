@@ -54,7 +54,7 @@ object PdfReflowExtractor {
                     if (code >= 0x20 || code == 0x0A || code == 0x09) sb.append(code.toChar())
                     idx += 4
                 }
-                return sb.toString()
+                return normalizeLigatures(sb.toString())
             }
 
             if (singleChar.isNotEmpty() || ranges.isNotEmpty()) {
@@ -76,15 +76,16 @@ object PdfReflowExtractor {
                 }
             }
 
-            // Fallback: 1-byte WinAnsi/ASCII hex pairs (or 2-byte if even nulls)
+            // Fallback: 1-byte WinAnsi/ASCII hex pairs
             val sb = StringBuilder()
             var idx = 0
             while (idx + 1 < clean.length) {
                 val b = clean.substring(idx, idx + 2).toIntOrNull(16) ?: 32
-                if (b >= 0x20 || b == 0x0A || b == 0x09) sb.append(b.toChar())
+                val mapped = decodeWinAnsiByte(b)
+                if (mapped != null) sb.append(mapped)
                 idx += 2
             }
-            return sb.toString()
+            return normalizeLigatures(sb.toString())
         }
 
         private fun lookup(code: Int): String? {
@@ -184,7 +185,125 @@ object PdfReflowExtractor {
         )
     }
 
-    private fun readPdfBytes(context: Context, uriString: String): ByteArray? = runCatching {
+    /**
+     * Extracts PDF /Outlines bookmark titles keyed by 0-based page index so Table of Contents
+     * displays real chapter names when the PDF embeds an outline tree.
+     */
+    suspend fun extractOutlineTitlesFromUri(
+        context: Context,
+        uriString: String
+    ): Map<Int, String> = withContext(Dispatchers.IO) {
+        val bytes = readPdfBytes(context, uriString, capBytes = 12 * 1024 * 1024) ?: return@withContext emptyMap()
+        extractOutlineTitlesFromBytes(bytes)
+    }
+
+    fun extractOutlineTitlesFromBytes(pdfBytes: ByteArray): Map<Int, String> {
+        val textView = String(pdfBytes, Charsets.ISO_8859_1)
+        val objects = parseIndirectObjects(pdfBytes, textView)
+        if (objects.isEmpty()) return emptyMap()
+        val pageObjects = resolveOrderedPageObjects(objects, textView)
+        if (pageObjects.isEmpty()) return emptyMap()
+
+        val pageNumToIndex = HashMap<Int, Int>(pageObjects.size)
+        pageObjects.forEachIndexed { idx, obj -> pageNumToIndex[obj.num] = idx }
+
+        val rootRef = Regex("/Root\\s+(\\d+)\\s+\\d+\\s+R").find(textView)?.groupValues?.get(1)?.toIntOrNull()
+        val catalogObj = rootRef?.let { objects[it] }
+            ?: objects.values.firstOrNull { it.body.contains("/Type\\s*/Catalog".toRegex()) }
+            ?: return emptyMap()
+        val outlinesRef = Regex("/Outlines\\s+(\\d+)\\s+\\d+\\s+R").find(catalogObj.body)?.groupValues?.get(1)?.toIntOrNull()
+            ?: return emptyMap()
+
+        val result = LinkedHashMap<Int, String>()
+        val visited = HashSet<Int>()
+
+        fun walkOutline(objNum: Int, depth: Int) {
+            if (depth > 4 || !visited.add(objNum) || result.size >= 200) return
+            val obj = objects[objNum] ?: return
+            val title = extractPdfDictString(obj.body, "Title")?.trim()
+            val destPageRef = Regex("/Dest\\s*\\[\\s*(\\d+)\\s+\\d+\\s+R").find(obj.body)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("/A\\s*<<[^>]*?/D\\s*\\[\\s*(\\d+)\\s+\\d+\\s+R").find(obj.body)?.groupValues?.get(1)?.toIntOrNull()
+            val pageIdx = destPageRef?.let { pageNumToIndex[it] }
+            if (!title.isNullOrBlank() && pageIdx != null && !result.containsKey(pageIdx)) {
+                result[pageIdx] = title
+            }
+            val firstChild = Regex("/First\\s+(\\d+)\\s+\\d+\\s+R").find(obj.body)?.groupValues?.get(1)?.toIntOrNull()
+            if (firstChild != null) walkOutline(firstChild, depth + 1)
+            val nextSibling = Regex("/Next\\s+(\\d+)\\s+\\d+\\s+R").find(obj.body)?.groupValues?.get(1)?.toIntOrNull()
+            if (nextSibling != null) walkOutline(nextSibling, depth)
+        }
+
+        walkOutline(outlinesRef, 0)
+        return result
+    }
+
+    private fun extractPdfDictString(body: String, key: String): String? {
+        val keyMatch = Regex("/$key\\b").find(body) ?: return null
+        var idx = keyMatch.range.last + 1
+        while (idx < body.length && body[idx].isWhitespace()) idx++
+        if (idx >= body.length) return null
+
+        if (body[idx] == '(') {
+            idx++
+            var depth = 1
+            val rawBytes = ArrayList<Byte>(64)
+            while (idx < body.length && depth > 0) {
+                val ch = body[idx]
+                when (ch) {
+                    '\\' -> {
+                        idx++
+                        if (idx >= body.length) break
+                        val esc = body[idx]
+                        when (esc) {
+                            'n' -> rawBytes.add('\n'.code.toByte())
+                            'r' -> rawBytes.add('\r'.code.toByte())
+                            't' -> rawBytes.add('\t'.code.toByte())
+                            'b' -> rawBytes.add('\b'.code.toByte())
+                            'f' -> rawBytes.add(0x0C)
+                            '\r' -> if (idx + 1 < body.length && body[idx + 1] == '\n') idx++
+                            '\n' -> {}
+                            in '0'..'7' -> {
+                                var oct = esc.code - '0'.code
+                                var digits = 1
+                                while (digits < 3 && idx + 1 < body.length && body[idx + 1] in '0'..'7') {
+                                    idx++
+                                    oct = (oct shl 3) or (body[idx].code - '0'.code)
+                                    digits++
+                                }
+                                rawBytes.add((oct and 0xFF).toByte())
+                            }
+                            else -> rawBytes.add(esc.code.toByte())
+                        }
+                    }
+                    '(' -> {
+                        depth++
+                        rawBytes.add('('.code.toByte())
+                    }
+                    ')' -> {
+                        depth--
+                        if (depth > 0) rawBytes.add(')'.code.toByte())
+                    }
+                    else -> rawBytes.add(ch.code.toByte())
+                }
+                idx++
+            }
+            val arr = rawBytes.toByteArray()
+            if (arr.size >= 2 && arr[0] == 0xFE.toByte() && arr[1] == 0xFF.toByte()) {
+                return String(arr, 2, arr.size - 2, Charsets.UTF_16BE)
+            }
+            return decodeWinAnsiString(String(arr, Charsets.ISO_8859_1))
+        }
+
+        if (body[idx] == '<' && (idx + 1 >= body.length || body[idx + 1] != '<')) {
+            val closeIdx = body.indexOf('>', idx + 1)
+            if (closeIdx > idx + 1) {
+                return FontCMap().decodeHex(body.substring(idx + 1, closeIdx))
+            }
+        }
+        return null
+    }
+
+    private fun readPdfBytes(context: Context, uriString: String, capBytes: Int = 48 * 1024 * 1024): ByteArray? = runCatching {
         val uri = Uri.parse(uriString)
         val input = when {
             uri.scheme == "file" && uri.path != null -> FileInputStream(File(uri.path!!))
@@ -193,7 +312,6 @@ object PdfReflowExtractor {
         } ?: return@runCatching null
 
         input.use { stream ->
-            val capBytes = 48 * 1024 * 1024
             val baos = ByteArrayOutputStream()
             val buf = ByteArray(16384)
             var total = 0
@@ -729,14 +847,75 @@ object PdfReflowExtractor {
     private fun appendDecodedToken(tok: StreamToken, cmap: FontCMap, out: StringBuilder) {
         when (tok.kind) {
             TokenKind.LITERAL_STRING -> {
-                val decoded = tok.value
-                out.append(decoded)
+                out.append(decodeWinAnsiString(tok.value))
             }
             TokenKind.HEX_STRING -> {
                 out.append(cmap.decodeHex(tok.value))
             }
             else -> {}
         }
+    }
+
+    private fun decodeWinAnsiString(raw: String): String {
+        var hasHighByte = false
+        for (c in raw) {
+            if (c.code in 0x80..0x9F) {
+                hasHighByte = true
+                break
+            }
+        }
+        val mapped = if (!hasHighByte) raw else buildString(raw.length) {
+            for (c in raw) {
+                val decoded = decodeWinAnsiByte(c.code)
+                if (decoded != null) append(decoded)
+            }
+        }
+        return normalizeLigatures(mapped)
+    }
+
+    private fun decodeWinAnsiByte(b: Int): Char? = when (b) {
+        0x80 -> '\u20AC' // €
+        0x82 -> '\u201A' // ‚
+        0x83 -> '\u0192' // ƒ
+        0x84 -> '\u201E' // „
+        0x85 -> '\u2026' // …
+        0x86 -> '\u2020' // †
+        0x87 -> '\u2021' // ‡
+        0x88 -> '\u02C6' // ˆ
+        0x89 -> '\u2030' // ‰
+        0x8A -> '\u0160' // Š
+        0x8B -> '\u2039' // ‹
+        0x8C -> '\u0152' // Œ
+        0x8E -> '\u017D' // Ž
+        0x91 -> '\u2018' // ‘
+        0x92 -> '\u2019' // ’
+        0x93 -> '\u201C' // “
+        0x94 -> '\u201D' // ”
+        0x95 -> '\u2022' // •
+        0x96 -> '\u2013' // –
+        0x97 -> '\u2014' // —
+        0x98 -> '\u02DC' // ˜
+        0x99 -> '\u2122' // ™
+        0x9A -> '\u0161' // š
+        0x9B -> '\u203A' // ›
+        0x9C -> '\u0153' // œ
+        0x9E -> '\u017E' // ž
+        0x9F -> '\u0178' // Ÿ
+        else -> if (b >= 0x20 || b == 0x0A || b == 0x09) b.toChar() else null
+    }
+
+    private fun normalizeLigatures(s: String): String {
+        if (!s.contains('\uFB00') && !s.contains('\uFB01') && !s.contains('\uFB02') &&
+            !s.contains('\uFB03') && !s.contains('\uFB04')
+        ) {
+            return s
+        }
+        return s
+            .replace("\uFB00", "ff")
+            .replace("\uFB01", "fi")
+            .replace("\uFB02", "fl")
+            .replace("\uFB03", "ffi")
+            .replace("\uFB04", "ffl")
     }
 
     private fun buildPlainText(blocks: List<ContentBlock>): String = buildString {

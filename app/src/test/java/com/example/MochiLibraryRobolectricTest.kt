@@ -4,7 +4,6 @@ import android.content.Context
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.library.SafBookScanner
-import com.example.data.library.SampleBookSeeder
 import com.example.theme.BundledThemes
 import com.example.theme.ThemePackManager
 import kotlinx.coroutines.test.runTest
@@ -26,19 +25,21 @@ import java.util.zip.ZipOutputStream
 class MochiLibraryRobolectricTest {
 
     @Test
-    fun sampleSeederAndScannerPreserveOriginalFileHashes() = runTest {
+    fun localScannerPreservesOriginalFileHashes() = runTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val samples = SampleBookSeeder.seedIfNeeded(context)
-        assertEquals(5, samples.size)
+        val fixtures = TestBookFixtures.createAll(context)
+        assertEquals(5, fixtures.size)
 
-        val epub = samples.first { it.file.name.endsWith(".epub") }
+        val epub = fixtures.first { it.file.name.endsWith(".epub") }
         val hashBefore = SafBookScanner.computeSha256 { FileInputStream(epub.file) }
 
-        val scanned = SafBookScanner.scanSeededSample(
+        val scanned = SafBookScanner.scanLocalBookFile(
             context = context,
-            sample = epub,
+            file = epub.file,
             existing = null,
-            shelfOrder = 0
+            shelfOrder = 0,
+            fallbackTitle = epub.title,
+            fallbackAuthors = epub.authors
         )
         val hashAfter = SafBookScanner.computeSha256 { FileInputStream(epub.file) }
 
