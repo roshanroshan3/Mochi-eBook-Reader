@@ -1,0 +1,15 @@
+# Mochi Reader Changelog
+
+## v1.1.22 (Automated Snapshot)
+- feat(ci/cd): implement dynamic versioning and CI enhancements (`745abba`)
+- Update hourly-ai-optimizer.yml (`d4abbf1`)
+- Update hourly-ai-optimizer.yml (`5c40fc7`)
+- Update hourly-ai-optimizer.yml (`b80f889`)
+- Update hourly-ai-optimizer.yml (`e585f75`)
+- Update build.yml (`88e78a9`)
+- Update build.yml (`057607b`)
+- Update build.yml (`0d14818`)
+- Create hourly-ai-optimizer.yml (`dae1573`)
+- Update build.yml (`de78e1b`)
+- Update build.yml (`59825e6`)
+- Update build.yml (`3900190`)
